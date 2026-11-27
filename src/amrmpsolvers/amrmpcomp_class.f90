@@ -8,6 +8,8 @@ module amrmpcomp_class
    use amrex_amr_module,  only: amrex_box,amrex_boxarray,amrex_distromap,amrex_mfiter,amrex_multifab
    use material_class,    only: material
    use thermorelax_class, only: thermorelax,RELAX_OK
+   use reaction_class,    only: reaction
+   use igmix_class,       only: igmix_t=>igmix
    implicit none
    private
 
@@ -54,6 +56,10 @@ module amrmpcomp_class
       integer :: Yg_lo=0,Yg_hi=-1        !< Gas    species range: Q(:,:,:,Yg_lo:Yg_hi)
       integer :: nSLF=isl                !< Components of the semi-Lagrangian face workspace
       type(amrdata) :: Yl,Ylold,Yg,Ygold !< Phasic mass fractions of the first ns-1 species (only if ns>1)
+
+      ! Gas-phase reaction model (optional): changes the gas composition at fixed density and internal energy
+      class(reaction), pointer :: chem=>null()
+      type(amrdata) :: HRR               !< Heat release rate per unit volume of the last apply_reaction call
 
       ! Surface tension coefficient
       real(WP) :: sigma=0.0_WP
@@ -115,6 +121,7 @@ module amrmpcomp_class
       real(WP) :: CFLa_x=0.0_WP,CFLa_y=0.0_WP,CFLa_z=0.0_WP  !< Acoustic
       real(WP) :: CFLv_x=0.0_WP,CFLv_y=0.0_WP,CFLv_z=0.0_WP  !< Viscous
       real(WP) :: CFLst=0.0_WP                               !< Capillary
+      real(WP) :: CFLchem=0.0_WP                             !< Chemical: dt times the largest reaction rate (not in get_cfl's cfl)
 
       ! Monitoring quantities
       real(WP) :: RHOLmin=0.0_WP,RHOLmax=0.0_WP,RHOGmin=0.0_WP,RHOGmax=0.0_WP
@@ -191,6 +198,7 @@ module amrmpcomp_class
       ! Physics procedures
       procedure :: get_primitive             !< Get phasic and mixture primitive variables from conserved variables
       procedure :: get_dQdt                  !< Compute dQdt and drhoUVWdt over a step
+      procedure :: apply_reaction            !< Advance the gas composition by the reaction model over dt (midpoint gas temperature)
       procedure :: get_energy                !< Set the phasic total energies of the new iterate from the transported internal energies, the phasic work, and the mixture work flux
       procedure :: apply_relax               !< Apply mechanical/thermal relaxation in mixed cells
       procedure :: add_viscartif             !< Add localized artificial bulk viscosity
@@ -411,6 +419,7 @@ contains
       call this%PGold%initialize  (amr,name='PGold'  ,ncomp=1,ng=this%nover_old); this%PGold%parent  =>this
       call this%TL%initialize   (amr,name='TL'   ,ncomp=1,ng=1         ); this%TL%parent   =>this
       call this%TG%initialize   (amr,name='TG'   ,ncomp=1,ng=1         ); this%TG%parent   =>this
+      call this%HRR%initialize  (amr,name='HRR'  ,ncomp=1,ng=0         ); this%HRR%parent  =>this
 
       ! Phasic species mass fractions (only if more than 1 species in the phase)
       if (this%liq%ns.gt.1) then
@@ -488,7 +497,7 @@ contains
       call this%RHOL%finalize(); call this%RHOG%finalize()
       call this%IL%finalize(); call this%IG%finalize()
       call this%PL%finalize(); call this%PG%finalize()
-      call this%TL%finalize(); call this%TG%finalize()
+      call this%TL%finalize(); call this%TG%finalize(); call this%HRR%finalize()
       call this%RHOLold%finalize(); call this%RHOGold%finalize()
       call this%PLold%finalize(); call this%PGold%finalize()
       if (this%liq%ns.gt.1) then
@@ -533,7 +542,7 @@ contains
       call this%RHOL%setval(val=0.0_WP,lvl=lvl); call this%RHOG%setval(val=0.0_WP,lvl=lvl)
       call this%IL%setval(val=0.0_WP,lvl=lvl); call this%IG%setval(val=0.0_WP,lvl=lvl)
       call this%PL%setval(val=0.0_WP,lvl=lvl); call this%PG%setval(val=0.0_WP,lvl=lvl)
-      call this%TL%setval(val=0.0_WP,lvl=lvl); call this%TG%setval(val=0.0_WP,lvl=lvl)
+      call this%TL%setval(val=0.0_WP,lvl=lvl); call this%TG%setval(val=0.0_WP,lvl=lvl); call this%HRR%setval(val=0.0_WP,lvl=lvl)
       call this%RHOLold%setval(val=0.0_WP,lvl=lvl); call this%RHOGold%setval(val=0.0_WP,lvl=lvl)
       call this%PLold%setval(val=0.0_WP,lvl=lvl); call this%PGold%setval(val=0.0_WP,lvl=lvl)
       if (this%liq%ns.gt.1) then
@@ -606,7 +615,7 @@ contains
       call this%RHOL%clear_level(lvl); call this%RHOG%clear_level(lvl)
       call this%IL%clear_level(lvl); call this%IG%clear_level(lvl)
       call this%PL%clear_level(lvl); call this%PG%clear_level(lvl)
-      call this%TL%clear_level(lvl); call this%TG%clear_level(lvl)
+      call this%TL%clear_level(lvl); call this%TG%clear_level(lvl); call this%HRR%clear_level(lvl)
       call this%RHOLold%clear_level(lvl); call this%RHOGold%clear_level(lvl)
       call this%PLold%clear_level(lvl); call this%PGold%clear_level(lvl)
       if (this%liq%ns.gt.1) then
@@ -637,7 +646,7 @@ contains
       call this%RHOL%reset_level(lvl,ba,dm); call this%RHOG%reset_level(lvl,ba,dm)
       call this%IL%reset_level(lvl,ba,dm); call this%IG%reset_level(lvl,ba,dm)
       call this%PL%reset_level(lvl,ba,dm); call this%PG%reset_level(lvl,ba,dm)
-      call this%TL%reset_level(lvl,ba,dm); call this%TG%reset_level(lvl,ba,dm)
+      call this%TL%reset_level(lvl,ba,dm); call this%TG%reset_level(lvl,ba,dm); call this%HRR%reset_level(lvl,ba,dm)
       call this%RHOLold%reset_level(lvl,ba,dm); call this%RHOGold%reset_level(lvl,ba,dm)
       call this%PLold%reset_level(lvl,ba,dm); call this%PGold%reset_level(lvl,ba,dm)
       if (this%liq%ns.gt.1) then
@@ -2736,6 +2745,50 @@ end subroutine get_cell_velocity
       end do
    end subroutine add_particle_energy
 
+   !> Advance the gas composition with the reaction model over dt, at the gas density and the midpoint gas temperature TG
+   !> (set by prepare_midpoint), in every gas-holding valid cell of every level. Call it in each sub-iteration after
+   !> Q=Qold+dt*dQdt. The total energy is unchanged: with formation energies in the gas EOS, the heat release follows from
+   !> the new composition. The reactant update is exact over dt at fixed T (positive for any dt).
+   subroutine apply_reaction(this,dt,time)
+      use messager, only: die
+      implicit none
+      class(amrmpcomp), intent(inout) :: this
+      real(WP), intent(in) :: dt,time
+      integer :: lvl,i,j,k,ns
+      type(amrex_mfiter) :: mfi
+      type(amrex_box) :: bx
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pVF,pTG,pHRR
+      real(WP), dimension(this%gas%ns) :: y,y0
+      real(WP) :: rhoG
+      if (.not.associated(this%chem)) return
+      ns=this%gas%ns
+      if (ns.lt.2) call die('[amrmpcomp apply_reaction] a reaction model needs a gas with at least 2 species')
+      if (this%chem%ns.ne.ns) call die('[amrmpcomp apply_reaction] reaction model and gas have different species counts')
+      do lvl=0,this%amr%clvl()
+         call this%amr%mfiter_build(lvl,mfi)
+         do while (mfi%next())
+            pQ=>this%Q%mf(lvl)%dataptr(mfi); pVF=>this%VF%mf(lvl)%dataptr(mfi)
+            pTG=>this%TG%mf(lvl)%dataptr(mfi); pHRR=>this%HRR%mf(lvl)%dataptr(mfi)
+            bx=mfi%tilebox()
+            do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               pHRR(i,j,k,1)=0.0_WP
+               if (pVF(i,j,k,1).gt.VFhi.or.pQ(i,j,k,2).le.0.0_WP.or.pTG(i,j,k,1).le.0.0_WP) cycle
+               rhoG=pQ(i,j,k,2)/(1.0_WP-pVF(i,j,k,1))
+               y=gas_y(this,pQ,i,j,k); y0=y
+               call this%chem%advance(rho=rhoG,T=pTG(i,j,k,1),y=y,dt=dt)
+               pQ(i,j,k,this%Yg_lo:this%Yg_hi)=pQ(i,j,k,2)*y(1:ns-1)
+               ! Heat release rate: chemical energy converted per unit volume and time
+               select type (g=>this%gas)
+               class is (igmix_t)
+                  pHRR(i,j,k,1)=-pQ(i,j,k,2)*sum((y-y0)*g%q)/dt
+               end select
+            end do; end do; end do
+         end do
+         call this%amr%mfiter_destroy(mfi)
+      end do
+      call this%Q%average_down(); call this%Q%fill(time=time)
+   end subroutine apply_reaction
+
    !> Build up the rest of phasic total energy using the updated face velocity, mass and momentum fluxes, and pressure and viscous work
    !> Bulk phase simplifies to adding centered KE contribution alongside the pressure and viscous work directly
    !> Mixture region requires redistributing the KE contribution by mass while viscous and pressure work is weighted by VF
@@ -3378,7 +3431,7 @@ end subroutine get_cell_velocity
       type(amrex_box) :: bx
       integer :: lvl,i,j,k,ierr
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pP,pU,pV,pW,pVisc,pBeta,pC
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pRHOL,pRHOG,pIL,pIG,pDiffL,pDiffG,pYl,pYg
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pRHOL,pRHOG,pIL,pIG,pDiffL,pDiffG,pYl,pYg,pTG
       real(WP) :: dxi,dyi,dzi,rho,conv,pgrad,viscmax,alpha_heat
       pYl=>null(); pYg=>null()
       ! Get convective CFL from parent
@@ -3388,6 +3441,7 @@ end subroutine get_cell_velocity
       this%CFLa_x=0.0_WP; this%CFLa_y=0.0_WP; this%CFLa_z=0.0_WP
       this%CFLv_x=0.0_WP; this%CFLv_y=0.0_WP; this%CFLv_z=0.0_WP
       this%CFLst=0.0_WP
+      this%CFLchem=0.0_WP
       ! Compute CFL at each level (finest level determines dt)
       do lvl=0,this%amr%clvl()
          ! Get mesh spacing
@@ -3408,6 +3462,7 @@ end subroutine get_cell_velocity
             pC=>this%C%mf(lvl)%dataptr(mfi)
             pVF=>this%VF%mf(lvl)%dataptr(mfi)
             pRHOL=>this%RHOL%mf(lvl)%dataptr(mfi); pRHOG=>this%RHOG%mf(lvl)%dataptr(mfi)
+            pTG=>this%TG%mf(lvl)%dataptr(mfi)
             pIL=>this%IL%mf(lvl)%dataptr(mfi); pIG=>this%IG%mf(lvl)%dataptr(mfi)
             pDiffL=>this%diffL%mf(lvl)%dataptr(mfi); pDiffG=>this%diffG%mf(lvl)%dataptr(mfi)
             if (this%liq%ns.gt.1) pYl=>this%Yl%mf(lvl)%dataptr(mfi)
@@ -3438,6 +3493,11 @@ end subroutine get_cell_velocity
                if (this%amr%nz.gt.1) this%CFLa_z=max(this%CFLa_z,(abs(0.5_WP*(pW(i,j,k,1)+pW(i,j,k+1,1)))+pC(i,j,k,1))*dt*dzi)
                ! Capillary CFL in finest-level mixed cells
                if (lvl.eq.this%amr%maxlvl.and.pVF(i,j,k,1).ge.VFlo.and.pVF(i,j,k,1).le.VFhi) this%CFLst=max(this%CFLst,dt*sqrt(4.0_WP*Pi*this%sigma/(rho*this%amr%min_meshsize(lvl)**3)))
+               ! Chemical CFL in gas-holding cells
+               if (associated(this%chem).and.this%gas%ns.gt.1) then
+                  if (pVF(i,j,k,1).le.VFhi.and.pRHOG(i,j,k,1).gt.0.0_WP) this%CFLchem=max(this%CFLchem, &
+                  &  dt*this%chem%get_rate(rho=pRHOG(i,j,k,1),T=pTG(i,j,k,1),y=cached_y(this%gas%ns,pYg,i,j,k)))
+               end if
             end do; end do; end do
          end do
          call this%amr%mfiter_destroy(mfi)
@@ -3451,6 +3511,7 @@ end subroutine get_cell_velocity
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%CFLv_y,1,MPI_REAL_WP,MPI_MAX,this%amr%comm,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%CFLv_z,1,MPI_REAL_WP,MPI_MAX,this%amr%comm,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%CFLst ,1,MPI_REAL_WP,MPI_MAX,this%amr%comm,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,this%CFLchem,1,MPI_REAL_WP,MPI_MAX,this%amr%comm,ierr)
       ! Return max CFL
       cfl=max(this%CFLc_x,this%CFLc_y,this%CFLc_z,this%CFLv_x,this%CFLv_y,this%CFLv_z)
       cfl=max(cfl,this%CFLa_x,this%CFLa_y,this%CFLa_z,this%CFLst)
