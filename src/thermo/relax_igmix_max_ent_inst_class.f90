@@ -105,7 +105,7 @@ contains
    !> A cell that is not relaxed is returned untouched with a non-OK code.
    !> Exception: a pure cell that pTg does not seed is already the maximum of S and returns RELAX_OK.
    subroutine max_ent_apply(this,dt,VF,Q,Pjump,ierr)
-      use amrvof_class, only: VFlo,VFhi
+      use thermorelax_class, only: VFlo,VFhi
       use messager,     only: die
       implicit none
       class(relax_igmix_max_ent_inst), intent(inout) :: this

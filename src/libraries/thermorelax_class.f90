@@ -4,6 +4,10 @@ module thermorelax_class
    implicit none
    private
    public :: thermorelax
+   !> Volume fraction bounds of a mixed cell (re-exported by amrvof_class); here so that thermo does not depend on amrmpsolvers
+   public :: VFlo,VFhi
+   real(WP), parameter :: VFlo=1.0e-12_WP    !< Minimum VF value considered
+   real(WP), parameter :: VFhi=1.0_WP-VFlo   !< Maximum VF value considered
    !> Relaxation status codes, returned via the optional ierr argument of apply
    !> (and the p_relax/pT_relax/pTg_relax workers). RELAX_OK=0 means relaxed cleanly.
    public :: RELAX_OK,RELAX_FAILED,RELAX_BAD_LIQUID,RELAX_BAD_GAS,RELAX_VACUUM_GAS,RELAX_DEGENERATE,RELAX_SINGULAR,RELAX_NUC_FAILED,RELAX_VACUUM_VAPOR

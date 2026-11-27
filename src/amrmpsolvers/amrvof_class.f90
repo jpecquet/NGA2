@@ -10,6 +10,7 @@ module amrvof_class
    use amrsolver_class,  only: amrsolver
    use surfmesh_class,   only: surfmesh
    use amrex_amr_module, only: amrex_multifab,amrex_box,amrex_boxarray,amrex_distromap
+   use thermorelax_class, only: VFlo,VFhi
    implicit none
    private
 
@@ -23,8 +24,7 @@ module amrvof_class
    integer, parameter, public :: BC_USER   =4  ! User-defined callback
 
    ! Default parameters for volume fraction
-   real(WP), parameter, public :: VFlo=1.0e-12_WP    ! Minimum VF value considered
-   real(WP), parameter, public :: VFhi=1.0_WP-VFlo   ! Maximum VF value considered
+   public :: VFlo,VFhi                               ! Minimum/maximum VF value considered (defined in thermorelax_class)
    real(WP), parameter, public :: vol_eps=1.0e-8_WP  ! Volume epsilon for division by zero
 
    !> Borrowed field objects; FAB pointers are reacquired on each refresh after regrids.

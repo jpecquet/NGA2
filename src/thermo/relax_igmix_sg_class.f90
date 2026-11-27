@@ -183,7 +183,7 @@ contains
    end subroutine debug_dump
 
    subroutine apply(this,dt,VF,Q,Pjump,ierr)
-      use amrvof_class, only: VFlo,VFhi
+      use thermorelax_class, only: VFlo,VFhi
       use nasg_class,   only: nasg
       implicit none
       class(relax_igmix_sg),  intent(inout) :: this
@@ -503,7 +503,7 @@ contains
    !> Nucleates a tiny opposite phase in metastable pure cells; calls pT_relax;
    !> runs pure-phase admissibility tests; falls back to LV (pure water) or LVG (with non-condensable) Newton solves.
    subroutine pTg_relax(this,dt,VF,Q,Pjump,ierr)
-      use amrvof_class, only: VFlo,VFhi
+      use thermorelax_class, only: VFlo,VFhi
       implicit none
       class(relax_igmix_sg),  intent(inout) :: this
       real(WP),               intent(in)    :: dt

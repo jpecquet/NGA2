@@ -59,7 +59,7 @@ contains
    !> Finite-rate Prelax leaves the phases out of pressure equilibrium; the parent's fixed-VF
    !> energy split (stage 2) would undo that, so this path bypasses it. Everything else is the parent's apply.
    subroutine apply(this,dt,VF,Q,Pjump,ierr)
-      use amrvof_class, only: VFlo,VFhi
+      use thermorelax_class, only: VFlo,VFhi
       use messager,     only: die
       implicit none
       class(relax_igmix_nasg_finite), intent(inout) :: this
@@ -441,7 +441,7 @@ contains
    !> runs pure-phase admissibility tests; falls back to LV (pure water) or LVG (with non-condensable) Newton solves.
    !> Finite-rate chemical step when CRR<huge (Pelanti 2022 eqs. 71-83).
    subroutine pTg_relax(this,dt,VF,Q,Pjump,ierr)
-      use amrvof_class, only: VFlo,VFhi
+      use thermorelax_class, only: VFlo,VFhi
       implicit none
       class(relax_igmix_nasg_finite), intent(inout) :: this
       real(WP),               intent(in)    :: dt
