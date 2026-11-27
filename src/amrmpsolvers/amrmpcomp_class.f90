@@ -1,4 +1,4 @@
-!> AMR staggered compressible multiphase solver class
+!> AMR staggered compressible multiphase solver class (phasic total energies, face momenta), with phasic species
 module amrmpcomp_class
    use iso_c_binding,     only: c_ptr,c_loc,c_f_pointer
    use precision,         only: WP
@@ -15,8 +15,8 @@ module amrmpcomp_class
    public :: amrmpcomp,VFlo,VFhi,BC_LIQ,BC_GAS,BC_REFLECT,BC_USER
 
    ! Semi-Lagrangian face flux components: phasic Q (1:4), CTU donor moments (5:16) sum(m*u_a(b)) and
-   ! sum(m*u_a(b+e_a)) per phase and momentum axis, and the gas isentrope sum (17) of the sliver step
-   integer, parameter :: nSLF=17
+   ! sum(m*u_a(b+e_a)) per phase and momentum axis, the gas isentrope sum (17) of the sliver step, then the species
+   ! partial densities Q(5:nQ) at isl+q-4 (the component count nSLF is a solver field)
    integer, parameter :: isl=17
 
    ! Unit vectors
@@ -48,6 +48,12 @@ module amrmpcomp_class
 
       ! Thermodynamic relaxation model
       class(thermorelax), pointer :: relax=>null()
+
+      ! Phasic species: Q(5:nQ) holds the first ns-1 partial densities of each phase, the last species is 1-sum
+      integer :: Yl_lo=0,Yl_hi=-1        !< Liquid species range: Q(:,:,:,Yl_lo:Yl_hi)
+      integer :: Yg_lo=0,Yg_hi=-1        !< Gas    species range: Q(:,:,:,Yg_lo:Yg_hi)
+      integer :: nSLF=isl                !< Components of the semi-Lagrangian face workspace
+      type(amrdata) :: Yl,Ylold,Yg,Ygold !< Phasic mass fractions of the first ns-1 species (only if ns>1)
 
       ! Surface tension coefficient
       real(WP) :: sigma=0.0_WP
@@ -120,6 +126,7 @@ module amrmpcomp_class
       real(WP) :: dPmax=0.0_WP
       real(WP) :: rhoUint=0.0_WP,rhoVint=0.0_WP,rhoWint=0.0_WP
       real(WP) :: rhoKint=0.0_WP
+      real(WP), dimension(:), allocatable :: Ylmin,Ylmax,Ygmin,Ygmax   !< Phasic mass fraction bounds (first ns-1 species)
       real(WP) :: nvf_guard=0.0_WP               !< Band cells whose transported phase volume sum vanished in the last get_dQdt call (given the majority phase)
       real(WP) :: nrelax_fail=0.0_WP             !< Mixed cells whose relaxation did not return RELAX_OK in the last call
       real(WP) :: nsliver=0.0_WP                 !< Mixed cells equilibrated as slivers in the last get_energy call
@@ -364,7 +371,10 @@ contains
       ! Materials must have been provided by the user before this call
       if (.not.associated(this%liq).or..not.associated(this%gas)) call die('[amrmpcomp initialize] liq and gas must be assigned before initialize')
       ! Assign number of arrays in Q, number of ghost cells
-      this%nQ=4; this%nover=max(this%nover,3); this%nover_vel=max(this%nover_vel,2); this%nover_old=max(this%nover_old,2)
+      ! Q layout: phasic masses and total energies, then the first ns-1 partial densities of each phase
+      this%nQ=4+(this%liq%ns-1)+(this%gas%ns-1); this%nover=max(this%nover,3); this%nover_vel=max(this%nover_vel,2); this%nover_old=max(this%nover_old,2)
+      this%Yl_lo=5; this%Yl_hi=3+this%liq%ns; this%Yg_lo=4+this%liq%ns; this%Yg_hi=2+this%liq%ns+this%gas%ns
+      this%nSLF=isl+this%nQ-4
       ! Compressible face velocities are not divergence-free
       this%interp_vel=interp_face_lin
       call this%amrmpflow%initialize(amr,name); call this%set_parent()
@@ -401,6 +411,18 @@ contains
       call this%PGold%initialize  (amr,name='PGold'  ,ncomp=1,ng=this%nover_old); this%PGold%parent  =>this
       call this%TL%initialize   (amr,name='TL'   ,ncomp=1,ng=1         ); this%TL%parent   =>this
       call this%TG%initialize   (amr,name='TG'   ,ncomp=1,ng=1         ); this%TG%parent   =>this
+
+      ! Phasic species mass fractions (only if more than 1 species in the phase)
+      if (this%liq%ns.gt.1) then
+         call this%Yl%initialize   (amr,name='Yl'   ,ncomp=this%liq%ns-1,ng=this%nover); this%Yl%parent   =>this
+         call this%Ylold%initialize(amr,name='Ylold',ncomp=this%liq%ns-1,ng=this%nover); this%Ylold%parent=>this
+         allocate(this%Ylmin(this%liq%ns-1),this%Ylmax(this%liq%ns-1)); this%Ylmin=0.0_WP; this%Ylmax=0.0_WP
+      end if
+      if (this%gas%ns.gt.1) then
+         call this%Yg%initialize   (amr,name='Yg'   ,ncomp=this%gas%ns-1,ng=this%nover); this%Yg%parent   =>this
+         call this%Ygold%initialize(amr,name='Ygold',ncomp=this%gas%ns-1,ng=this%nover); this%Ygold%parent=>this
+         allocate(this%Ygmin(this%gas%ns-1),this%Ygmax(this%gas%ns-1)); this%Ygmin=0.0_WP; this%Ygmax=0.0_WP
+      end if
 
       ! Initialize physical properties (Neumann BCs on those)
       call this%visc%initialize (amr,name='visc' ,ncomp=1,ng=1); this%visc%parent =>this
@@ -469,6 +491,12 @@ contains
       call this%TL%finalize(); call this%TG%finalize()
       call this%RHOLold%finalize(); call this%RHOGold%finalize()
       call this%PLold%finalize(); call this%PGold%finalize()
+      if (this%liq%ns.gt.1) then
+         call this%Yl%finalize(); call this%Ylold%finalize(); deallocate(this%Ylmin,this%Ylmax)
+      end if
+      if (this%gas%ns.gt.1) then
+         call this%Yg%finalize(); call this%Ygold%finalize(); deallocate(this%Ygmin,this%Ygmax)
+      end if
       call this%visc%finalize(); call this%beta%finalize()
       call this%diffL%finalize(); call this%diffG%finalize()
       call destroy_fluxes(this)
@@ -508,6 +536,12 @@ contains
       call this%TL%setval(val=0.0_WP,lvl=lvl); call this%TG%setval(val=0.0_WP,lvl=lvl)
       call this%RHOLold%setval(val=0.0_WP,lvl=lvl); call this%RHOGold%setval(val=0.0_WP,lvl=lvl)
       call this%PLold%setval(val=0.0_WP,lvl=lvl); call this%PGold%setval(val=0.0_WP,lvl=lvl)
+      if (this%liq%ns.gt.1) then
+         call this%Yl%setval(val=0.0_WP,lvl=lvl); call this%Ylold%setval(val=0.0_WP,lvl=lvl)
+      end if
+      if (this%gas%ns.gt.1) then
+         call this%Yg%setval(val=0.0_WP,lvl=lvl); call this%Ygold%setval(val=0.0_WP,lvl=lvl)
+      end if
       call this%visc%setval(val=0.0_WP,lvl=lvl); call this%beta%setval(val=0.0_WP,lvl=lvl)
       call this%diffL%setval(val=0.0_WP,lvl=lvl); call this%diffG%setval(val=0.0_WP,lvl=lvl)
    end subroutine on_init
@@ -575,6 +609,12 @@ contains
       call this%TL%clear_level(lvl); call this%TG%clear_level(lvl)
       call this%RHOLold%clear_level(lvl); call this%RHOGold%clear_level(lvl)
       call this%PLold%clear_level(lvl); call this%PGold%clear_level(lvl)
+      if (this%liq%ns.gt.1) then
+         call this%Yl%clear_level(lvl); call this%Ylold%clear_level(lvl)
+      end if
+      if (this%gas%ns.gt.1) then
+         call this%Yg%clear_level(lvl); call this%Ygold%clear_level(lvl)
+      end if
       call this%visc%clear_level(lvl); call this%beta%clear_level(lvl)
       call this%diffL%clear_level(lvl); call this%diffG%clear_level(lvl)
       call destroy_fluxes(this,lvl)
@@ -600,6 +640,12 @@ contains
       call this%TL%reset_level(lvl,ba,dm); call this%TG%reset_level(lvl,ba,dm)
       call this%RHOLold%reset_level(lvl,ba,dm); call this%RHOGold%reset_level(lvl,ba,dm)
       call this%PLold%reset_level(lvl,ba,dm); call this%PGold%reset_level(lvl,ba,dm)
+      if (this%liq%ns.gt.1) then
+         call this%Yl%reset_level(lvl,ba,dm); call this%Ylold%reset_level(lvl,ba,dm)
+      end if
+      if (this%gas%ns.gt.1) then
+         call this%Yg%reset_level(lvl,ba,dm); call this%Ygold%reset_level(lvl,ba,dm)
+      end if
       call this%visc%reset_level(lvl,ba,dm); call this%beta%reset_level(lvl,ba,dm)
       call this%diffL%reset_level(lvl,ba,dm); call this%diffG%reset_level(lvl,ba,dm)
       call build_fluxes(this,lvl,ba,dm)
@@ -640,7 +686,7 @@ contains
          call mfab_rebuild(this%curvold,ba,dm,nc=1,ng=1)
          call mfab_rebuild(this%SDold  ,ba,dm,nc=1,ng=1)
          do a=1,3
-            call mfab_rebuild(this%SLF(a),ba,dm,nc=nSLF,ng=1,nodal=eu(:,a).eq.1)
+            call mfab_rebuild(this%SLF(a),ba,dm,nc=this%nSLF,ng=1,nodal=eu(:,a).eq.1)
             call mfab_rebuild(this%SLV(a),ba,dm,nc=8   ,ng=0,nodal=eu(:,a).eq.1)
             call mfab_rebuild(this%Pj(a) ,ba,dm,nc=1   ,ng=0,nodal=eu(:,a).eq.1)
          end do
@@ -713,9 +759,9 @@ contains
                if (pNew(i,j,k,1).lt.0.5_WP) cycle
                mk=max(pQ(i,j,k,1:2),0.0_WP)
                Kc=cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
-               if (pRHOL(i,j,k,1).gt.0.0_WP.and.pPL(i,j,k,1).ne.0.0_WP) pQ(i,j,k,3)=pVF(i,j,k,1)*this%liq%get_rhoe_from_p_rho(p=pPL(i,j,k,1),rho=pRHOL(i,j,k,1),y=[1.0_WP]) &
+               if (pRHOL(i,j,k,1).gt.0.0_WP.and.pPL(i,j,k,1).ne.0.0_WP) pQ(i,j,k,3)=pVF(i,j,k,1)*this%liq%get_rhoe_from_p_rho(p=pPL(i,j,k,1),rho=pRHOL(i,j,k,1),y=liq_y(this,pQ,i,j,k)) &
                &                                                                    +mk(1)/max(sum(mk),this%rho_floor)*Kc
-               if (pRHOG(i,j,k,1).gt.0.0_WP.and.pPG(i,j,k,1).ne.0.0_WP) pQ(i,j,k,4)=(1.0_WP-pVF(i,j,k,1))*this%gas%get_rhoe_from_p_rho(p=pPG(i,j,k,1),rho=pRHOG(i,j,k,1),y=[1.0_WP]) &
+               if (pRHOG(i,j,k,1).gt.0.0_WP.and.pPG(i,j,k,1).ne.0.0_WP) pQ(i,j,k,4)=(1.0_WP-pVF(i,j,k,1))*this%gas%get_rhoe_from_p_rho(p=pPG(i,j,k,1),rho=pRHOG(i,j,k,1),y=gas_y(this,pQ,i,j,k)) &
                &                                                                    +mk(2)/max(sum(mk),this%rho_floor)*Kc
             end do; end do; end do
          end do
@@ -782,6 +828,8 @@ contains
       call this%RHOGold%copy(src=this%RHOG)
       call this%PLold%copy(src=this%PL)
       call this%PGold%copy(src=this%PG)
+      if (this%liq%ns.gt.1) call this%Ylold%copy(src=this%Yl)
+      if (this%gas%ns.gt.1) call this%Ygold%copy(src=this%Yg)
       if (this%amr%clvl().lt.this%amr%maxlvl) return
       call this%curvold%copy(srcmf=this%curv,srccomp=1,dstcomp=1,nc=1,ng=1)
       call this%SDold%copy  (srcmf=this%SD  ,srccomp=1,dstcomp=1,nc=1,ng=1)
@@ -799,9 +847,13 @@ contains
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pRHOL,pPL,pTL,pRHOLold,pPLold
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pRHOG,pPG,pTG,pRHOGold,pPGold
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pP,pVFold
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pYl,pYlold,pYg,pYgold
       real(WP) :: Pn,Iold,Inew
+      real(WP), dimension(this%liq%ns) :: yLo,yLn
+      real(WP), dimension(this%gas%ns) :: yGo,yGn
       logical :: has_old,has_new
       tw0=MPI_Wtime()
+      pYl=>null(); pYlold=>null(); pYg=>null(); pYgold=>null()
       ! Face velocities
       call this%U%lincomb(a=0.5_WP,src1=this%Uold,b=0.5_WP,src2=this%U)
       call this%V%lincomb(a=0.5_WP,src1=this%Vold,b=0.5_WP,src2=this%V)
@@ -818,21 +870,29 @@ contains
             pTL  =>this%TL%mf(lvl)%dataptr(mfi)
             pTG  =>this%TG%mf(lvl)%dataptr(mfi)
             pP   =>this%P%mf(lvl)%dataptr(mfi);    pVFold  =>this%VFold%mf(lvl)%dataptr(mfi)
+            if (this%liq%ns.gt.1) then
+               pYl=>this%Yl%mf(lvl)%dataptr(mfi); pYlold=>this%Ylold%mf(lvl)%dataptr(mfi)
+            end if
+            if (this%gas%ns.gt.1) then
+               pYg=>this%Yg%mf(lvl)%dataptr(mfi); pYgold=>this%Ygold%mf(lvl)%dataptr(mfi)
+            end if
             ! Phasic temperature
             bx=mfi%growntilebox(min(this%TL%ng,this%TG%ng))
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                ! Liquid
                has_old=pRHOLold(i,j,k,1).gt.0.0_WP; has_new=pRHOL(i,j,k,1).gt.0.0_WP
-               Iold=0.0_WP; if (has_old) Iold=this%liq%get_e_from_p_rho(p=pPLold(i,j,k,1),rho=pRHOLold(i,j,k,1),y=[1.0_WP])
-               Inew=0.0_WP; if (has_new) Inew=this%liq%get_e_from_p_rho(p=pPL   (i,j,k,1),rho=pRHOL   (i,j,k,1),y=[1.0_WP])
+               yLo=cached_y(this%liq%ns,pYlold,i,j,k); yLn=cached_y(this%liq%ns,pYl,i,j,k)
+               Iold=0.0_WP; if (has_old) Iold=this%liq%get_e_from_p_rho(p=pPLold(i,j,k,1),rho=pRHOLold(i,j,k,1),y=yLo)
+               Inew=0.0_WP; if (has_new) Inew=this%liq%get_e_from_p_rho(p=pPL   (i,j,k,1),rho=pRHOL   (i,j,k,1),y=yLn)
                pTL(i,j,k,1)=0.0_WP
-               if (has_old.or.has_new) pTL(i,j,k,1)=this%liq%get_T_from_rho_e(rho=midval(pRHOLold(i,j,k,1),pRHOL(i,j,k,1),has_old,has_new),e=midval(Iold,Inew,has_old,has_new),y=[1.0_WP])
+               if (has_old.or.has_new) pTL(i,j,k,1)=this%liq%get_T_from_rho_e(rho=midval(pRHOLold(i,j,k,1),pRHOL(i,j,k,1),has_old,has_new),e=midval(Iold,Inew,has_old,has_new),y=midvec(yLo,yLn,has_old,has_new))
                ! Gas
                has_old=pRHOGold(i,j,k,1).gt.0.0_WP; has_new=pRHOG(i,j,k,1).gt.0.0_WP
-               Iold=0.0_WP; if (has_old) Iold=this%gas%get_e_from_p_rho(p=pPGold(i,j,k,1),rho=pRHOGold(i,j,k,1),y=[1.0_WP])
-               Inew=0.0_WP; if (has_new) Inew=this%gas%get_e_from_p_rho(p=pPG   (i,j,k,1),rho=pRHOG   (i,j,k,1),y=[1.0_WP])
+               yGo=cached_y(this%gas%ns,pYgold,i,j,k); yGn=cached_y(this%gas%ns,pYg,i,j,k)
+               Iold=0.0_WP; if (has_old) Iold=this%gas%get_e_from_p_rho(p=pPGold(i,j,k,1),rho=pRHOGold(i,j,k,1),y=yGo)
+               Inew=0.0_WP; if (has_new) Inew=this%gas%get_e_from_p_rho(p=pPG   (i,j,k,1),rho=pRHOG   (i,j,k,1),y=yGn)
                pTG(i,j,k,1)=0.0_WP
-               if (has_old.or.has_new) pTG(i,j,k,1)=this%gas%get_T_from_rho_e(rho=midval(pRHOGold(i,j,k,1),pRHOG(i,j,k,1),has_old,has_new),e=midval(Iold,Inew,has_old,has_new),y=[1.0_WP])
+               if (has_old.or.has_new) pTG(i,j,k,1)=this%gas%get_T_from_rho_e(rho=midval(pRHOGold(i,j,k,1),pRHOG(i,j,k,1),has_old,has_new),e=midval(Iold,Inew,has_old,has_new),y=midvec(yGo,yGn,has_old,has_new))
             end do; end do; end do
             ! Phasic mixture pressure
             bx=mfi%growntilebox(min(this%PL%ng,this%PG%ng,this%P%ng,this%VFold%ng))
@@ -847,9 +907,11 @@ contains
                ! Mixture
                pP(i,j,k,1)=0.5_WP*(Pn+pP(i,j,k,1))
             end do; end do; end do
-            ! Phasic densities
+            ! Phasic mass fractions and densities
             bx=mfi%growntilebox(this%nover)
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
+               if (this%liq%ns.gt.1) pYl(i,j,k,:)=midvec(pYlold(i,j,k,:),pYl(i,j,k,:),pRHOLold(i,j,k,1).gt.0.0_WP,pRHOL(i,j,k,1).gt.0.0_WP)
+               if (this%gas%ns.gt.1) pYg(i,j,k,:)=midvec(pYgold(i,j,k,:),pYg(i,j,k,:),pRHOGold(i,j,k,1).gt.0.0_WP,pRHOG(i,j,k,1).gt.0.0_WP)
                pRHOL (i,j,k,1)=midval(pRHOLold (i,j,k,1),pRHOL (i,j,k,1),pRHOLold(i,j,k,1).gt.0.0_WP,pRHOL(i,j,k,1).gt.0.0_WP)
                pRHOG (i,j,k,1)=midval(pRHOGold (i,j,k,1),pRHOG (i,j,k,1),pRHOGold(i,j,k,1).gt.0.0_WP,pRHOG(i,j,k,1).gt.0.0_WP)
             end do; end do; end do
@@ -871,6 +933,20 @@ contains
             midval=vnew
          end if
       end function midval
+      !> Componentwise midval of two compositions
+      pure function midvec(vold,vnew,has_old,has_new) result(v)
+         implicit none
+         real(WP), dimension(:), intent(in) :: vold,vnew
+         logical, intent(in) :: has_old,has_new
+         real(WP), dimension(size(vold)) :: v
+         if (has_old.and.has_new) then
+            v=0.5_WP*(vold+vnew)
+         else if (has_old) then
+            v=vold
+         else
+            v=vnew
+         end if
+      end function midvec
    end subroutine prepare_midpoint
 
    !> Surface tension pressure jump on finest-level faces: mean of the start-of-step and current-iterate jumps
@@ -1210,16 +1286,62 @@ end subroutine get_cell_velocity
 
    !> Isentrope factor (p+pinf)**(1/gamma) of a gas state, with gamma=1+Gruneisen and p+pinf=rho*c**2/gamma from the gas
    !> law (exact for ideal and stiffened gases)
-   real(WP) function isentrope_factor(gas,p,rho) result(theta)
+   real(WP) function isentrope_factor(gas,p,rho,y) result(theta)
       implicit none
       class(material), intent(in) :: gas
       real(WP), intent(in) :: p,rho
+      real(WP), dimension(:), intent(in) :: y
       real(WP) :: g
       theta=0.0_WP
       if (rho.le.0.0_WP) return
-      g=1.0_WP+gas%get_gruneisen_from_rho_e(rho=rho,e=gas%get_e_from_p_rho(p=p,rho=rho,y=[1.0_WP]),y=[1.0_WP])
-      theta=(rho*gas%get_c_from_p_rho(p=p,rho=rho,y=[1.0_WP])**2/g)**(1.0_WP/g)
+      g=1.0_WP+gas%get_gruneisen_from_rho_e(rho=rho,e=gas%get_e_from_p_rho(p=p,rho=rho,y=y),y=y)
+      theta=(rho*gas%get_c_from_p_rho(p=p,rho=rho,y=y)**2/g)**(1.0_WP/g)
    end function isentrope_factor
+
+   !> Full composition of a phase from its first ns-1 partial densities qs and its mass m (last species 1-sum, clipped to [0,1])
+   pure function mass_y(ns,qs,m) result(y)
+      implicit none
+      integer, intent(in) :: ns
+      real(WP), dimension(:), intent(in) :: qs
+      real(WP), intent(in) :: m
+      real(WP), dimension(ns) :: y
+      y(1:ns-1)=0.0_WP
+      if (m.gt.0.0_WP) y(1:ns-1)=max(0.0_WP,min(qs/m,1.0_WP))
+      y(ns)=max(0.0_WP,1.0_WP-sum(y(1:ns-1)))
+   end function mass_y
+
+   !> Full composition of a phase at (i,j,k) from its cached ns-1 mass fractions pY (not referenced if ns=1)
+   function cached_y(ns,pY,i,j,k) result(y)
+      implicit none
+      integer, intent(in) :: ns,i,j,k
+      real(WP), dimension(:,:,:,:), contiguous, pointer, intent(in) :: pY
+      real(WP), dimension(ns) :: y
+      y(ns)=1.0_WP
+      if (ns.gt.1) then
+         y(1:ns-1)=pY(i,j,k,:)
+         y(ns)=max(0.0_WP,1.0_WP-sum(y(1:ns-1)))
+      end if
+   end function cached_y
+
+   !> Liquid composition of cell (i,j,k) of a Q array
+   function liq_y(this,pQ,i,j,k) result(y)
+      implicit none
+      class(amrmpcomp), intent(in) :: this
+      real(WP), dimension(:,:,:,:), contiguous, pointer, intent(in) :: pQ
+      integer, intent(in) :: i,j,k
+      real(WP), dimension(this%liq%ns) :: y
+      y=mass_y(this%liq%ns,pQ(i,j,k,this%Yl_lo:this%Yl_hi),pQ(i,j,k,1))
+   end function liq_y
+
+   !> Gas composition of cell (i,j,k) of a Q array
+   function gas_y(this,pQ,i,j,k) result(y)
+      implicit none
+      class(amrmpcomp), intent(in) :: this
+      real(WP), dimension(:,:,:,:), contiguous, pointer, intent(in) :: pQ
+      integer, intent(in) :: i,j,k
+      real(WP), dimension(this%gas%ns) :: y
+      y=mass_y(this%gas%ns,pQ(i,j,k,this%Yg_lo:this%Yg_hi),pQ(i,j,k,2))
+   end function gas_y
 
    ! ============================================================================
    ! PHYSICS METHODS
@@ -1239,7 +1361,7 @@ end subroutine get_cell_velocity
       type(amrex_mfiter) :: mfi
       type(amrex_box) :: bx
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pVF,pRHOL,pRHOG,pIL,pIG,pPL,pPG,pTL,pTG,pP,pC
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pU,pV,pW
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pU,pV,pW,pYl,pYg
       real(WP), dimension(2) :: CLG
       real(WP) :: CL,CG
       type(amrex_box) :: vbx
@@ -1250,6 +1372,7 @@ end subroutine get_cell_velocity
       ! Face velocities from momentum
       call this%get_face_velocity(Q,rhoU,rhoV,rhoW,time)
       tw0=MPI_Wtime()
+      pYl=>null(); pYg=>null()
       ! Loop over levels
       do lvl=0,this%amr%clvl()
          call this%amr%mfiter_build(lvl,mfi)
@@ -1264,20 +1387,26 @@ end subroutine get_cell_velocity
             pTL =>this%TL%mf(lvl)%dataptr(mfi);   pTG =>this%TG%mf(lvl)%dataptr(mfi)
             pP  =>this%P%mf(lvl)%dataptr(mfi)
             pC  =>this%C%mf(lvl)%dataptr(mfi)
-            ! Phasic densities
+            if (this%liq%ns.gt.1) pYl=>this%Yl%mf(lvl)%dataptr(mfi)
+            if (this%gas%ns.gt.1) pYg=>this%Yg%mf(lvl)%dataptr(mfi)
+            ! Phasic densities and mass fractions (first ns-1 species, clipped to [0,1])
             bx=mfi%growntilebox(this%nover)
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                ! Liquid
                if (pVF(i,j,k,1).ge.VFlo.and.pQ(i,j,k,1).gt.0.0_WP) then
                   pRHOL(i,j,k,1)=pQ(i,j,k,1)/pVF(i,j,k,1)
+                  if (this%liq%ns.gt.1) pYl(i,j,k,:)=max(0.0_WP,min(pQ(i,j,k,this%Yl_lo:this%Yl_hi)/pQ(i,j,k,1),1.0_WP))
                else
                   pRHOL(i,j,k,1)=0.0_WP
+                  if (this%liq%ns.gt.1) pYl(i,j,k,:)=0.0_WP
                end if
                ! Gas
                if (pVF(i,j,k,1).le.VFhi.and.pQ(i,j,k,2).gt.0.0_WP) then
                   pRHOG(i,j,k,1)=pQ(i,j,k,2)/(1.0_WP-pVF(i,j,k,1))
+                  if (this%gas%ns.gt.1) pYg(i,j,k,:)=max(0.0_WP,min(pQ(i,j,k,this%Yg_lo:this%Yg_hi)/pQ(i,j,k,2),1.0_WP))
                else
                   pRHOG(i,j,k,1)=0.0_WP
+                  if (this%gas%ns.gt.1) pYg(i,j,k,:)=0.0_WP
                end if
             end do; end do; end do
             ! Phasic internal energies from total energies, then phasic pressures
@@ -1303,6 +1432,8 @@ end subroutine get_cell_velocity
             pTL =>this%TL%mf(lvl)%dataptr(mfi);   pTG =>this%TG%mf(lvl)%dataptr(mfi)
             pP  =>this%P%mf(lvl)%dataptr(mfi)
             pC  =>this%C%mf(lvl)%dataptr(mfi)
+            if (this%liq%ns.gt.1) pYl=>this%Yl%mf(lvl)%dataptr(mfi)
+            if (this%gas%ns.gt.1) pYg=>this%Yg%mf(lvl)%dataptr(mfi)
             ! Ghosts outside a non-periodic domain boundary, or whose coarse parent lacks the phase, keep their own pressures;
             ! then the mixture pressure
             vbx=mfi%validbox()
@@ -1326,9 +1457,9 @@ end subroutine get_cell_velocity
             bx=mfi%growntilebox(min(this%TL%ng,this%TG%ng))
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                pTL(i,j,k,1)=0.0_WP
-               if (pRHOL(i,j,k,1).gt.0.0_WP) pTL(i,j,k,1)=this%liq%get_T_from_p_rho(p=pPL(i,j,k,1),rho=pRHOL(i,j,k,1),y=[1.0_WP])
+               if (pRHOL(i,j,k,1).gt.0.0_WP) pTL(i,j,k,1)=this%liq%get_T_from_p_rho(p=pPL(i,j,k,1),rho=pRHOL(i,j,k,1),y=cached_y(this%liq%ns,pYl,i,j,k))
                pTG(i,j,k,1)=0.0_WP
-               if (pRHOG(i,j,k,1).gt.0.0_WP) pTG(i,j,k,1)=this%gas%get_T_from_p_rho(p=pPG(i,j,k,1),rho=pRHOG(i,j,k,1),y=[1.0_WP])
+               if (pRHOG(i,j,k,1).gt.0.0_WP) pTG(i,j,k,1)=this%gas%get_T_from_p_rho(p=pPG(i,j,k,1),rho=pRHOG(i,j,k,1),y=cached_y(this%gas%ns,pYg,i,j,k))
             end do; end do; end do
             ! Phasic internal energies and mixture speed of sound 
             bx=mfi%growntilebox(min(this%IL%ng,this%IG%ng,this%C%ng))
@@ -1336,14 +1467,14 @@ end subroutine get_cell_velocity
                ! Liquid
                CL=0.0_WP; pIL(i,j,k,1)=0.0_WP
                if (pRHOL(i,j,k,1).gt.0.0_WP) then
-                  pIL(i,j,k,1)=this%liq%get_e_from_p_rho(p=pPL(i,j,k,1),rho=pRHOL(i,j,k,1),y=[1.0_WP])
-                  CL          =this%liq%get_c_from_p_rho(p=pPL(i,j,k,1),rho=pRHOL(i,j,k,1),y=[1.0_WP])
+                  pIL(i,j,k,1)=this%liq%get_e_from_p_rho(p=pPL(i,j,k,1),rho=pRHOL(i,j,k,1),y=cached_y(this%liq%ns,pYl,i,j,k))
+                  CL          =this%liq%get_c_from_p_rho(p=pPL(i,j,k,1),rho=pRHOL(i,j,k,1),y=cached_y(this%liq%ns,pYl,i,j,k))
                end if
                ! Gas
                CG=0.0_WP; pIG(i,j,k,1)=0.0_WP
                if (pRHOG(i,j,k,1).gt.0.0_WP) then
-                  pIG(i,j,k,1)=this%gas%get_e_from_p_rho(p=pPG(i,j,k,1),rho=pRHOG(i,j,k,1),y=[1.0_WP])
-                  CG          =this%gas%get_c_from_p_rho(p=pPG(i,j,k,1),rho=pRHOG(i,j,k,1),y=[1.0_WP])
+                  pIG(i,j,k,1)=this%gas%get_e_from_p_rho(p=pPG(i,j,k,1),rho=pRHOG(i,j,k,1),y=cached_y(this%gas%ns,pYg,i,j,k))
+                  CG          =this%gas%get_c_from_p_rho(p=pPG(i,j,k,1),rho=pRHOG(i,j,k,1),y=cached_y(this%gas%ns,pYg,i,j,k))
                end if
                ! Mixture speed of sound
                pC(i,j,k,1)=sqrt((pQ(i,j,k,1)*CL**2+pQ(i,j,k,2)*CG**2)/max(pQ(i,j,k,1)+pQ(i,j,k,2),this%rho_floor))
@@ -1362,9 +1493,9 @@ end subroutine get_cell_velocity
          mk=max(pQ(i,j,k,1:2),0.0_WP)
          Y=pQ(i,j,k,3:4)-mk/max(sum(mk),this%rho_floor)*cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
          pPL(i,j,k,1)=0.0_WP
-         if (pRHOL(i,j,k,1).gt.0.0_WP.and.Y(1).gt.0.0_WP) pPL(i,j,k,1)=this%liq%get_p_from_rho_e(rho=pRHOL(i,j,k,1),e=Y(1)/pQ(i,j,k,1),y=[1.0_WP])
+         if (pRHOL(i,j,k,1).gt.0.0_WP.and.Y(1).gt.0.0_WP) pPL(i,j,k,1)=this%liq%get_p_from_rho_e(rho=pRHOL(i,j,k,1),e=Y(1)/pQ(i,j,k,1),y=cached_y(this%liq%ns,pYl,i,j,k))
          pPG(i,j,k,1)=0.0_WP
-         if (pRHOG(i,j,k,1).gt.0.0_WP.and.Y(2).gt.0.0_WP) pPG(i,j,k,1)=this%gas%get_p_from_rho_e(rho=pRHOG(i,j,k,1),e=Y(2)/pQ(i,j,k,2),y=[1.0_WP])
+         if (pRHOG(i,j,k,1).gt.0.0_WP.and.Y(2).gt.0.0_WP) pPG(i,j,k,1)=this%gas%get_p_from_rho_e(rho=pRHOG(i,j,k,1),e=Y(2)/pQ(i,j,k,2),y=cached_y(this%gas%ns,pYg,i,j,k))
       end subroutine phasic_pressures
    end subroutine get_primitive
 
@@ -1382,10 +1513,12 @@ end subroutine get_cell_velocity
       real(WP) :: dx,dy,dz,dxi,dyi,dzi
       logical :: on_sl
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pQold,pVFold,pPLICold,pPLold,pPGold,pVF,pBand,pRHOLold,pRHOGold
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pYl,pYg
       type(fab_ptr), dimension(3) :: pVel,pVelold,pF,pM
       integer, dimension(3) :: halo_lo,halo_hi
 
       tw0=MPI_Wtime(); tw1=tw0
+      pYl=>null(); pYg=>null()
       ! Build the band on the finest level
       if (this%amr%clvl().lt.this%amr%maxlvl) call die('[amrmpcomp get_dQdt] the finest level must exist')
       slvl=this%amr%maxlvl
@@ -1425,7 +1558,7 @@ end subroutine get_cell_velocity
          integer , dimension(3,9) :: fijk
          real(WP), dimension(:,:,:,:), allocatable :: proj
          real(WP), dimension(8) :: Vflux,Vacc
-         real(WP), dimension(nSLF) :: Qflux
+         real(WP), dimension(this%nSLF) :: Qflux
          real(WP), dimension(:,:,:,:), contiguous, pointer :: pVx,pVy,pVz,pFx,pFy,pFz
          type(amrex_mfiter) :: mfi
          type(amrex_box) :: fbx,nbx,vbx
@@ -1660,6 +1793,8 @@ end subroutine get_cell_velocity
          real(WP), dimension(:,:,:,:), contiguous, pointer :: pFUx,pFUy,pFUz
          real(WP), dimension(:,:,:,:), contiguous, pointer :: pFVx,pFVy,pFVz
          real(WP), dimension(:,:,:,:), contiguous, pointer :: pFWx,pFWy,pFWz,pP
+         real(WP), dimension(this%liq%ns) :: yLp,yLm
+         real(WP), dimension(this%gas%ns) :: yGp,yGm
          ! Zero RHS: the flux divergences are added after C/F averaging
          call dQdt%setval(val=0.0_WP)
          ! Traverse levels
@@ -1685,6 +1820,8 @@ end subroutine get_cell_velocity
                pTL=>this%TL%mf(lvl)%dataptr(mfi); pTG=>this%TG%mf(lvl)%dataptr(mfi)
                pDiffL=>this%diffL%mf(lvl)%dataptr(mfi); pDiffG=>this%diffG%mf(lvl)%dataptr(mfi)
                pP=>this%P%mf(lvl)%dataptr(mfi)
+               if (this%liq%ns.gt.1) pYl=>this%Yl%mf(lvl)%dataptr(mfi)
+               if (this%gas%ns.gt.1) pYg=>this%Yg%mf(lvl)%dataptr(mfi)
                pFx=>this%Fx(lvl)%dataptr(mfi)
                pFy=>this%Fy(lvl)%dataptr(mfi)
                pFz=>this%Fz(lvl)%dataptr(mfi)
@@ -1716,6 +1853,7 @@ end subroutine get_cell_velocity
                   efx=i.ge.bx%lo(1).and.i.le.bx%hi(1)+1.and.j.ge.bx%lo(2).and.j.le.bx%hi(2).and.k.ge.bx%lo(3).and.k.le.bx%hi(3)
                   if (bandx) then
                      pFx(i,j,k,1:4)=pF(1)%p(i,j,k,1:4)
+                     pFx(i,j,k,5:this%nQ)=pF(1)%p(i,j,k,isl+1:this%nSLF)
                   else if (pVF(i,j,k,1).gt.0.5_WP) then
                      ! No gas fluxes
                      pFx(i,j,k,2)=0.0_WP; pFx(i,j,k,4)=0.0_WP
@@ -1724,12 +1862,13 @@ end subroutine get_cell_velocity
                      w=weno_weight((abs(pRHOL(i+1,j,k,1)-pRHOL(i  ,j,k,1))+eps)/(abs(pRHOL(i,j,k,1)-pRHOL(i-1,j,k,1))+eps)); wxm=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
                      rhop=sum(wxp*pRHOL(i-2:i  ,j,k,1)); rhom=sum(wxm*pRHOL(i-1:i+1,j,k,1))
                      pFx(i,j,k,1)=-0.5_WP*(pU(i,j,k,1)+abs(pU(i,j,k,1)))*rhop-0.5_WP*(pU(i,j,k,1)-abs(pU(i,j,k,1)))*rhom
+                     call species_flux(1,1,[i,j,k],yLp,yLm)
                      ! Liquid internal energy from the reconstructed density (above) and pressure, through the equation of state
                      if (efx) then
                         w=weno_weight((abs(pPL(i-1,j,k,1)-pPL(i-2,j,k,1))+eps)/(abs(pPL(i,j,k,1)-pPL(i-1,j,k,1))+eps)); wxp=0.5_WP*[      -w,1.0_WP+2.0_WP*w,1.0_WP-w]
                         w=weno_weight((abs(pPL(i+1,j,k,1)-pPL(i  ,j,k,1))+eps)/(abs(pPL(i,j,k,1)-pPL(i-1,j,k,1))+eps)); wxm=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
-                        pFx(i,j,k,3)=-0.5_WP*(pU(i,j,k,1)+abs(pU(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wxp*pPL(i-2:i  ,j,k,1)),rho=rhop,y=[1.0_WP]) &
-                        &            -0.5_WP*(pU(i,j,k,1)-abs(pU(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wxm*pPL(i-1:i+1,j,k,1)),rho=rhom,y=[1.0_WP])
+                        pFx(i,j,k,3)=-0.5_WP*(pU(i,j,k,1)+abs(pU(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wxp*pPL(i-2:i  ,j,k,1)),rho=rhop,y=yLp) &
+                        &            -0.5_WP*(pU(i,j,k,1)-abs(pU(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wxm*pPL(i-1:i+1,j,k,1)),rho=rhom,y=yLm)
                      end if
                   else
                      ! No liquid fluxes
@@ -1739,12 +1878,13 @@ end subroutine get_cell_velocity
                      w=weno_weight((abs(pRHOG(i+1,j,k,1)-pRHOG(i  ,j,k,1))+eps)/(abs(pRHOG(i,j,k,1)-pRHOG(i-1,j,k,1))+eps)); wxm=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
                      rhop=sum(wxp*pRHOG(i-2:i  ,j,k,1)); rhom=sum(wxm*pRHOG(i-1:i+1,j,k,1))
                      pFx(i,j,k,2)=-0.5_WP*(pU(i,j,k,1)+abs(pU(i,j,k,1)))*rhop-0.5_WP*(pU(i,j,k,1)-abs(pU(i,j,k,1)))*rhom
+                     call species_flux(2,1,[i,j,k],yGp,yGm)
                      ! Gas internal energy from the reconstructed density (above) and pressure
                      if (efx) then
                         w=weno_weight((abs(pPG(i-1,j,k,1)-pPG(i-2,j,k,1))+eps)/(abs(pPG(i,j,k,1)-pPG(i-1,j,k,1))+eps)); wxp=0.5_WP*[      -w,1.0_WP+2.0_WP*w,1.0_WP-w]
                         w=weno_weight((abs(pPG(i+1,j,k,1)-pPG(i  ,j,k,1))+eps)/(abs(pPG(i,j,k,1)-pPG(i-1,j,k,1))+eps)); wxm=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
-                        pFx(i,j,k,4)=-0.5_WP*(pU(i,j,k,1)+abs(pU(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wxp*pPG(i-2:i  ,j,k,1)),rho=rhop,y=[1.0_WP]) &
-                        &            -0.5_WP*(pU(i,j,k,1)-abs(pU(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wxm*pPG(i-1:i+1,j,k,1)),rho=rhom,y=[1.0_WP])
+                        pFx(i,j,k,4)=-0.5_WP*(pU(i,j,k,1)+abs(pU(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wxp*pPG(i-2:i  ,j,k,1)),rho=rhop,y=yGp) &
+                        &            -0.5_WP*(pU(i,j,k,1)-abs(pU(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wxm*pPG(i-1:i+1,j,k,1)),rho=rhom,y=yGm)
                      end if
                   end if
                   if (.not.bandx.and.efx) then
@@ -1758,6 +1898,7 @@ end subroutine get_cell_velocity
                   efy=j.ge.bx%lo(2).and.j.le.bx%hi(2)+1.and.i.ge.bx%lo(1).and.i.le.bx%hi(1).and.k.ge.bx%lo(3).and.k.le.bx%hi(3)
                   if (bandy) then
                      pFy(i,j,k,1:4)=pF(2)%p(i,j,k,1:4)
+                     pFy(i,j,k,5:this%nQ)=pF(2)%p(i,j,k,isl+1:this%nSLF)
                   else if (pVF(i,j,k,1).gt.0.5_WP) then
                      ! No gas fluxes
                      pFy(i,j,k,2)=0.0_WP; pFy(i,j,k,4)=0.0_WP
@@ -1766,12 +1907,13 @@ end subroutine get_cell_velocity
                      w=weno_weight((abs(pRHOL(i,j+1,k,1)-pRHOL(i,j  ,k,1))+eps)/(abs(pRHOL(i,j,k,1)-pRHOL(i,j-1,k,1))+eps)); wym=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
                      rhop=sum(wyp*pRHOL(i,j-2:j  ,k,1)); rhom=sum(wym*pRHOL(i,j-1:j+1,k,1))
                      pFy(i,j,k,1)=-0.5_WP*(pV(i,j,k,1)+abs(pV(i,j,k,1)))*rhop-0.5_WP*(pV(i,j,k,1)-abs(pV(i,j,k,1)))*rhom
+                     call species_flux(1,2,[i,j,k],yLp,yLm)
                      ! Liquid internal energy from the reconstructed density (above) and pressure
                      if (efy) then
                         w=weno_weight((abs(pPL(i,j-1,k,1)-pPL(i,j-2,k,1))+eps)/(abs(pPL(i,j,k,1)-pPL(i,j-1,k,1))+eps)); wyp=0.5_WP*[      -w,1.0_WP+2.0_WP*w,1.0_WP-w]
                         w=weno_weight((abs(pPL(i,j+1,k,1)-pPL(i,j  ,k,1))+eps)/(abs(pPL(i,j,k,1)-pPL(i,j-1,k,1))+eps)); wym=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
-                        pFy(i,j,k,3)=-0.5_WP*(pV(i,j,k,1)+abs(pV(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wyp*pPL(i,j-2:j  ,k,1)),rho=rhop,y=[1.0_WP]) &
-                        &            -0.5_WP*(pV(i,j,k,1)-abs(pV(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wym*pPL(i,j-1:j+1,k,1)),rho=rhom,y=[1.0_WP])
+                        pFy(i,j,k,3)=-0.5_WP*(pV(i,j,k,1)+abs(pV(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wyp*pPL(i,j-2:j  ,k,1)),rho=rhop,y=yLp) &
+                        &            -0.5_WP*(pV(i,j,k,1)-abs(pV(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wym*pPL(i,j-1:j+1,k,1)),rho=rhom,y=yLm)
                      end if
                   else
                      ! No liquid fluxes
@@ -1781,12 +1923,13 @@ end subroutine get_cell_velocity
                      w=weno_weight((abs(pRHOG(i,j+1,k,1)-pRHOG(i,j  ,k,1))+eps)/(abs(pRHOG(i,j,k,1)-pRHOG(i,j-1,k,1))+eps)); wym=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
                      rhop=sum(wyp*pRHOG(i,j-2:j  ,k,1)); rhom=sum(wym*pRHOG(i,j-1:j+1,k,1))
                      pFy(i,j,k,2)=-0.5_WP*(pV(i,j,k,1)+abs(pV(i,j,k,1)))*rhop-0.5_WP*(pV(i,j,k,1)-abs(pV(i,j,k,1)))*rhom
+                     call species_flux(2,2,[i,j,k],yGp,yGm)
                      ! Gas internal energy from the reconstructed density (above) and pressure
                      if (efy) then
                         w=weno_weight((abs(pPG(i,j-1,k,1)-pPG(i,j-2,k,1))+eps)/(abs(pPG(i,j,k,1)-pPG(i,j-1,k,1))+eps)); wyp=0.5_WP*[      -w,1.0_WP+2.0_WP*w,1.0_WP-w]
                         w=weno_weight((abs(pPG(i,j+1,k,1)-pPG(i,j  ,k,1))+eps)/(abs(pPG(i,j,k,1)-pPG(i,j-1,k,1))+eps)); wym=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
-                        pFy(i,j,k,4)=-0.5_WP*(pV(i,j,k,1)+abs(pV(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wyp*pPG(i,j-2:j  ,k,1)),rho=rhop,y=[1.0_WP]) &
-                        &            -0.5_WP*(pV(i,j,k,1)-abs(pV(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wym*pPG(i,j-1:j+1,k,1)),rho=rhom,y=[1.0_WP])
+                        pFy(i,j,k,4)=-0.5_WP*(pV(i,j,k,1)+abs(pV(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wyp*pPG(i,j-2:j  ,k,1)),rho=rhop,y=yGp) &
+                        &            -0.5_WP*(pV(i,j,k,1)-abs(pV(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wym*pPG(i,j-1:j+1,k,1)),rho=rhom,y=yGm)
                      end if
                   end if
                   if (.not.bandy.and.efy) then
@@ -1800,6 +1943,7 @@ end subroutine get_cell_velocity
                   efz=k.ge.bx%lo(3).and.k.le.bx%hi(3)+1.and.i.ge.bx%lo(1).and.i.le.bx%hi(1).and.j.ge.bx%lo(2).and.j.le.bx%hi(2)
                   if (bandz) then
                      pFz(i,j,k,1:4)=pF(3)%p(i,j,k,1:4)
+                     pFz(i,j,k,5:this%nQ)=pF(3)%p(i,j,k,isl+1:this%nSLF)
                   else if (pVF(i,j,k,1).gt.0.5_WP) then
                      ! No gas fluxes
                      pFz(i,j,k,2)=0.0_WP; pFz(i,j,k,4)=0.0_WP
@@ -1808,12 +1952,13 @@ end subroutine get_cell_velocity
                      w=weno_weight((abs(pRHOL(i,j,k+1,1)-pRHOL(i,j,k  ,1))+eps)/(abs(pRHOL(i,j,k,1)-pRHOL(i,j,k-1,1))+eps)); wzm=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
                      rhop=sum(wzp*pRHOL(i,j,k-2:k  ,1)); rhom=sum(wzm*pRHOL(i,j,k-1:k+1,1))
                      pFz(i,j,k,1)=-0.5_WP*(pW(i,j,k,1)+abs(pW(i,j,k,1)))*rhop-0.5_WP*(pW(i,j,k,1)-abs(pW(i,j,k,1)))*rhom
+                     call species_flux(1,3,[i,j,k],yLp,yLm)
                      ! Liquid internal energy from the reconstructed density (above) and pressure
                      if (efz) then
                         w=weno_weight((abs(pPL(i,j,k-1,1)-pPL(i,j,k-2,1))+eps)/(abs(pPL(i,j,k,1)-pPL(i,j,k-1,1))+eps)); wzp=0.5_WP*[      -w,1.0_WP+2.0_WP*w,1.0_WP-w]
                         w=weno_weight((abs(pPL(i,j,k+1,1)-pPL(i,j,k  ,1))+eps)/(abs(pPL(i,j,k,1)-pPL(i,j,k-1,1))+eps)); wzm=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
-                        pFz(i,j,k,3)=-0.5_WP*(pW(i,j,k,1)+abs(pW(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wzp*pPL(i,j,k-2:k  ,1)),rho=rhop,y=[1.0_WP]) &
-                        &            -0.5_WP*(pW(i,j,k,1)-abs(pW(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wzm*pPL(i,j,k-1:k+1,1)),rho=rhom,y=[1.0_WP])
+                        pFz(i,j,k,3)=-0.5_WP*(pW(i,j,k,1)+abs(pW(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wzp*pPL(i,j,k-2:k  ,1)),rho=rhop,y=yLp) &
+                        &            -0.5_WP*(pW(i,j,k,1)-abs(pW(i,j,k,1)))*this%liq%get_rhoe_from_p_rho(p=sum(wzm*pPL(i,j,k-1:k+1,1)),rho=rhom,y=yLm)
                      end if
                   else
                      ! No liquid fluxes
@@ -1823,12 +1968,13 @@ end subroutine get_cell_velocity
                      w=weno_weight((abs(pRHOG(i,j,k+1,1)-pRHOG(i,j,k  ,1))+eps)/(abs(pRHOG(i,j,k,1)-pRHOG(i,j,k-1,1))+eps)); wzm=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
                      rhop=sum(wzp*pRHOG(i,j,k-2:k  ,1)); rhom=sum(wzm*pRHOG(i,j,k-1:k+1,1))
                      pFz(i,j,k,2)=-0.5_WP*(pW(i,j,k,1)+abs(pW(i,j,k,1)))*rhop-0.5_WP*(pW(i,j,k,1)-abs(pW(i,j,k,1)))*rhom
+                     call species_flux(2,3,[i,j,k],yGp,yGm)
                      ! Gas internal energy from the reconstructed density (above) and pressure
                      if (efz) then
                         w=weno_weight((abs(pPG(i,j,k-1,1)-pPG(i,j,k-2,1))+eps)/(abs(pPG(i,j,k,1)-pPG(i,j,k-1,1))+eps)); wzp=0.5_WP*[      -w,1.0_WP+2.0_WP*w,1.0_WP-w]
                         w=weno_weight((abs(pPG(i,j,k+1,1)-pPG(i,j,k  ,1))+eps)/(abs(pPG(i,j,k,1)-pPG(i,j,k-1,1))+eps)); wzm=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,      -w]
-                        pFz(i,j,k,4)=-0.5_WP*(pW(i,j,k,1)+abs(pW(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wzp*pPG(i,j,k-2:k  ,1)),rho=rhop,y=[1.0_WP]) &
-                        &            -0.5_WP*(pW(i,j,k,1)-abs(pW(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wzm*pPG(i,j,k-1:k+1,1)),rho=rhom,y=[1.0_WP])
+                        pFz(i,j,k,4)=-0.5_WP*(pW(i,j,k,1)+abs(pW(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wzp*pPG(i,j,k-2:k  ,1)),rho=rhop,y=yGp) &
+                        &            -0.5_WP*(pW(i,j,k,1)-abs(pW(i,j,k,1)))*this%gas%get_rhoe_from_p_rho(p=sum(wzm*pPG(i,j,k-1:k+1,1)),rho=rhom,y=yGm)
                      end if
                   end if
                   if (.not.bandz.and.efz) then
@@ -1977,6 +2123,7 @@ end subroutine get_cell_velocity
                bx=mfi%tilebox()
                do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
                   pdQdt(i,j,k,1:4)=pdQdt(i,j,k,1:4)+dxi*(pFx(i+1,j,k,1:4)-pFx(i,j,k,1:4))+dyi*(pFy(i,j+1,k,1:4)-pFy(i,j,k,1:4))+dzi*(pFz(i,j,k+1,1:4)-pFz(i,j,k,1:4))
+                  if (this%nQ.gt.4) pdQdt(i,j,k,5:)=pdQdt(i,j,k,5:)+dxi*(pFx(i+1,j,k,5:)-pFx(i,j,k,5:))+dyi*(pFy(i,j+1,k,5:)-pFy(i,j,k,5:))+dzi*(pFz(i,j,k+1,5:)-pFz(i,j,k,5:))
                end do; end do; end do
             end do
             call this%amr%mfiter_destroy(mfi)
@@ -1996,6 +2143,50 @@ end subroutine get_cell_velocity
          real(WP), parameter :: delta=0.01_WP
          weno_weight=(1.0_WP-tanh((ratio-lambda)/delta))/3.0_WP+(1.0_WP-tanh((ratio-1.0_WP/lambda)/delta))/6.0_WP
       end function weno_weight
+
+      !> Species fluxes of phase ph (1 liquid, 2 gas) on b-face n from its mass flux and WENO mass fractions (zero for the
+      !> other phase), and the face compositions yp (from the minus side) and ym (from the plus side)
+      subroutine species_flux(ph,b,n,yp,ym)
+         implicit none
+         integer, intent(in) :: ph,b
+         integer, dimension(3), intent(in) :: n
+         real(WP), dimension(:), intent(out) :: yp,ym
+         real(WP), parameter :: eps=1.0e-15_WP
+         real(WP), dimension(:,:,:,:), contiguous, pointer :: pY
+         real(WP), dimension(-2:1) :: ys
+         real(WP), dimension(-2: 0) :: wenop
+         real(WP), dimension(-1:+1) :: wenom
+         real(WP) :: w,mf
+         integer :: ns,lo,s
+         integer, dimension(3) :: m
+         ! The other phase carries no species through this face
+         if (ph.eq.1) then
+            pM(b)%p(n(1),n(2),n(3),this%Yg_lo:this%Yg_hi)=0.0_WP
+            ns=this%liq%ns; lo=this%Yl_lo; pY=>pYl
+         else
+            pM(b)%p(n(1),n(2),n(3),this%Yl_lo:this%Yl_hi)=0.0_WP
+            ns=this%gas%ns; lo=this%Yg_lo; pY=>pYg
+         end if
+         yp(ns)=1.0_WP; ym(ns)=1.0_WP
+         if (ns.eq.1) return
+         mf=pM(b)%p(n(1),n(2),n(3),ph)
+         do s=1,ns-1
+            m=n-2*eu(:,b); ys(-2)=pY(m(1),m(2),m(3),s)
+            m=n-  eu(:,b); ys(-1)=pY(m(1),m(2),m(3),s)
+            m=n          ; ys( 0)=pY(m(1),m(2),m(3),s)
+            m=n+  eu(:,b); ys(+1)=pY(m(1),m(2),m(3),s)
+            w=weno_weight((abs(ys(-1)-ys(-2))+eps)/(abs(ys(0)-ys(-1))+eps)); wenop=0.5_WP*[-w,1.0_WP+2.0_WP*w,1.0_WP-w]
+            w=weno_weight((abs(ys(+1)-ys( 0))+eps)/(abs(ys(0)-ys(-1))+eps)); wenom=0.5_WP*[1.0_WP-w,1.0_WP+2.0_WP*w,-w]
+            yp(s)=sum(wenop*ys(-2:0)); ym(s)=sum(wenom*ys(-1:1))
+            ! Bound the face values by the two cells of the face, so transport cannot create new extrema of Y
+            yp(s)=max(min(ys(-1),ys(0)),min(max(ys(-1),ys(0)),yp(s)))
+            ym(s)=max(min(ys(-1),ys(0)),min(max(ys(-1),ys(0)),ym(s)))
+            pM(b)%p(n(1),n(2),n(3),lo+s-1)=0.5_WP*(mf-abs(mf))*yp(s)+0.5_WP*(mf+abs(mf))*ym(s)
+         end do
+         ! Face compositions for the equation of state
+         yp(1:ns-1)=max(0.0_WP,min(yp(1:ns-1),1.0_WP)); yp(ns)=max(0.0_WP,1.0_WP-sum(yp(1:ns-1)))
+         ym(1:ns-1)=max(0.0_WP,min(ym(1:ns-1),1.0_WP)); ym(ns)=max(0.0_WP,1.0_WP-sum(ym(1:ns-1)))
+      end subroutine species_flux
 
       ! Band momentum flux helpers
       ! a: momentum axis; 
@@ -2190,7 +2381,7 @@ end subroutine get_cell_velocity
          real(WP), dimension(3,4), intent(in) :: mytet
          integer,  dimension(3,4), intent(in) :: myind
          real(WP), dimension(8),    intent(out) :: myVflux
-         real(WP), dimension(nSLF), intent(out) :: myQflux
+         real(WP), dimension(this%nSLF), intent(out) :: myQflux
          integer :: dir,cut_ind,icase,n1,n2,v1,v2
          real(WP), dimension(4) :: dd
          real(WP), dimension(3,8) :: vert
@@ -2200,7 +2391,7 @@ end subroutine get_cell_velocity
          integer,  dimension(3,4) :: newind
          real(WP), dimension(3) :: a1,b1,c1
          real(WP), dimension(8) :: subVflux
-         real(WP), dimension(nSLF) :: subQflux
+         real(WP), dimension(this%nSLF) :: subQflux
          real(WP) :: xcut,ycut,zcut
 
          myVflux=0.0_WP
@@ -2280,7 +2471,7 @@ end subroutine get_cell_velocity
          real(WP), dimension(3,4), intent(in) :: mytet
          integer,  intent(in) :: i0,j0,k0
          real(WP), dimension(8),    intent(out) :: myVflux
-         real(WP), dimension(nSLF), intent(out) :: myQflux
+         real(WP), dimension(this%nSLF), intent(out) :: myQflux
          integer :: icase,n1,v1,v2
          real(WP), dimension(4) :: dd
          real(WP), dimension(3,8) :: vert
@@ -2308,6 +2499,7 @@ end subroutine get_cell_velocity
             myVflux(3:5)=vol_tot*bary_tot
             myQflux(1:2)=vol_tot*pQold(i0,j0,k0,1:2)
             myQflux(3:4)=vol_tot*[rhoe_old(1,i0,j0,k0),rhoe_old(2,i0,j0,k0)]
+            myQflux(isl+1:this%nSLF)=vol_tot*pQold(i0,j0,k0,5:this%nQ)
             call donor_moments(i0,j0,k0,myQflux)
             return
          else if (pPLICold(i0,j0,k0,4).lt.-1.0e9_WP) then
@@ -2316,7 +2508,8 @@ end subroutine get_cell_velocity
             myVflux(6:8)=vol_tot*bary_tot
             myQflux(1:2)=vol_tot*pQold(i0,j0,k0,1:2)
             myQflux(3:4)=vol_tot*[rhoe_old(1,i0,j0,k0),rhoe_old(2,i0,j0,k0)]
-            myQflux(isl)=vol_tot*isentrope_factor(this%gas,pPGold(i0,j0,k0,1),pRHOGold(i0,j0,k0,1))
+            myQflux(isl)=vol_tot*isentrope_factor(this%gas,pPGold(i0,j0,k0,1),pRHOGold(i0,j0,k0,1),gas_y(this,pQold,i0,j0,k0))
+            myQflux(isl+1:this%nSLF)=vol_tot*pQold(i0,j0,k0,5:this%nQ)
             call donor_moments(i0,j0,k0,myQflux)
             return
          end if
@@ -2380,15 +2573,17 @@ end subroutine get_cell_velocity
             myVflux(6:8)=vol_tot*bary_tot-myVflux(3:5)
          end if
 
-         ! Phasic masses and internal energies from the donor's old phasic state
+         ! Phasic masses, species and internal energies from the donor's old phasic state
          if (VF0.ge.VFlo) then
             myQflux(1)=myVflux(1)*pQold(i0,j0,k0,1)/VF0
             myQflux(3)=myVflux(1)*rhoe_old(1,i0,j0,k0)
+            if (this%liq%ns.gt.1) myQflux(isl+this%Yl_lo-4:isl+this%Yl_hi-4)=myVflux(1)*pQold(i0,j0,k0,this%Yl_lo:this%Yl_hi)/VF0
          end if
          if (VF0.le.VFhi) then
             myQflux(2)=myVflux(2)*pQold(i0,j0,k0,2)/(1.0_WP-VF0)
             myQflux(4)=myVflux(2)*rhoe_old(2,i0,j0,k0)
-            myQflux(isl)=myVflux(2)*isentrope_factor(this%gas,pPGold(i0,j0,k0,1),pRHOGold(i0,j0,k0,1))
+            myQflux(isl)=myVflux(2)*isentrope_factor(this%gas,pPGold(i0,j0,k0,1),pRHOGold(i0,j0,k0,1),gas_y(this,pQold,i0,j0,k0))
+            if (this%gas%ns.gt.1) myQflux(isl+this%Yg_lo-4:isl+this%Yg_hi-4)=myVflux(2)*pQold(i0,j0,k0,this%Yg_lo:this%Yg_hi)/(1.0_WP-VF0)
          end if
          call donor_moments(i0,j0,k0,myQflux)
 
@@ -2401,9 +2596,9 @@ end subroutine get_cell_velocity
          integer, intent(in) :: n,i,j,k
          rhoe_old=0.0_WP
          if (n.eq.1) then
-            if (pRHOLold(i,j,k,1).gt.0.0_WP) rhoe_old=this%liq%get_rhoe_from_p_rho(p=pPLold(i,j,k,1),rho=pRHOLold(i,j,k,1),y=[1.0_WP])
+            if (pRHOLold(i,j,k,1).gt.0.0_WP) rhoe_old=this%liq%get_rhoe_from_p_rho(p=pPLold(i,j,k,1),rho=pRHOLold(i,j,k,1),y=liq_y(this,pQold,i,j,k))
          else
-            if (pRHOGold(i,j,k,1).gt.0.0_WP) rhoe_old=this%gas%get_rhoe_from_p_rho(p=pPGold(i,j,k,1),rho=pRHOGold(i,j,k,1),y=[1.0_WP])
+            if (pRHOGold(i,j,k,1).gt.0.0_WP) rhoe_old=this%gas%get_rhoe_from_p_rho(p=pPGold(i,j,k,1),rho=pRHOGold(i,j,k,1),y=gas_y(this,pQold,i,j,k))
          end if
       end function rhoe_old
 
@@ -2411,7 +2606,7 @@ end subroutine get_cell_velocity
       subroutine donor_moments(i0,j0,k0,myQflux)
          implicit none
          integer, intent(in) :: i0,j0,k0
-         real(WP), dimension(nSLF), intent(inout) :: myQflux
+         real(WP), dimension(this%nSLF), intent(inout) :: myQflux
          integer :: phase,ax
          integer, dimension(3) :: up
          do phase=1,2
@@ -2561,6 +2756,7 @@ end subroutine get_cell_velocity
       real(WP) :: dxi,dyi,dzi,div,dss,dW,Kn,Cap,Asl,aG,Pst,dY,rG,eG,cG,g
       real(WP), dimension(3) :: gradU
       real(WP), dimension(2) :: S,mk,mkn,Yb
+      real(WP), dimension(this%gas%ns) :: yG
       logical :: inband
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pQold,pVF,pPL,pPG,pP,pU,pV,pW,pUold,pVold,pWold,pBand
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pVFold,pPGold,pRHOGold,pSx,pSy,pSz
@@ -2596,15 +2792,15 @@ end subroutine get_cell_velocity
             mkn=max(pQold(i,j,k,1:2),0.0_WP)
             Yb=pQ(i,j,k,3:4)-mkn/max(sum(mkn),this%rho_floor)*cell_ke(pQold,pUold,pVold,pWold,i,j,k,this%rho_floor)
             ! Isentrope sum of the gas parcels: the cell's own start-of-step gas, then the band face fluxes
-            Asl=(1.0_WP-pVFold(i,j,k,1))*isentrope_factor(this%gas,pPGold(i,j,k,1),pRHOGold(i,j,k,1))
+            Asl=(1.0_WP-pVFold(i,j,k,1))*isentrope_factor(this%gas,pPGold(i,j,k,1),pRHOGold(i,j,k,1),gas_y(this,pQold,i,j,k))
             Asl=Asl+dt*(dxi*(pSx(i+1,j,k,isl)-pSx(i,j,k,isl))+dyi*(pSy(i,j+1,k,isl)-pSy(i,j,k,isl))+dzi*(pSz(i,j,k+1,isl)-pSz(i,j,k,isl)))
             if (Asl.le.0.0_WP.or.Yb(2).le.0.0_WP) cycle
             ! Gas content at the common pressure (gas law constants from the transported gas state), and the change handed to the liquid
-            aG=1.0_WP-pVF(i,j,k,1); rG=pQ(i,j,k,2)/aG; eG=Yb(2)/pQ(i,j,k,2)
-            cG=this%gas%get_c_from_rho_e(rho=rG,e=eG,y=[1.0_WP]); if (cG.le.0.0_WP) cycle
-            g=1.0_WP+this%gas%get_gruneisen_from_rho_e(rho=rG,e=eG,y=[1.0_WP])
-            Pst=(Asl/aG)**g-(rG*cG**2/g-this%gas%get_p_from_rho_e(rho=rG,e=eG,y=[1.0_WP]))
-            dY=aG*this%gas%get_rhoe_from_p_rho(p=Pst,rho=rG,y=[1.0_WP])-Yb(2)
+            aG=1.0_WP-pVF(i,j,k,1); rG=pQ(i,j,k,2)/aG; eG=Yb(2)/pQ(i,j,k,2); yG=gas_y(this,pQ,i,j,k)
+            cG=this%gas%get_c_from_rho_e(rho=rG,e=eG,y=yG); if (cG.le.0.0_WP) cycle
+            g=1.0_WP+this%gas%get_gruneisen_from_rho_e(rho=rG,e=eG,y=yG)
+            Pst=(Asl/aG)**g-(rG*cG**2/g-this%gas%get_p_from_rho_e(rho=rG,e=eG,y=yG))
+            dY=aG*this%gas%get_rhoe_from_p_rho(p=Pst,rho=rG,y=yG)-Yb(2)
             pQ(i,j,k,4)=pQ(i,j,k,4)+dY
             pQ(i,j,k,3)=pQ(i,j,k,3)-dY
             this%cnt%nsliver=this%cnt%nsliver+1.0_WP
@@ -2811,7 +3007,10 @@ end subroutine get_cell_velocity
       real(WP), dimension(3) :: lo,hi,bary_liq,bary_gas
       real(WP), dimension(3,8) :: hex
       real(WP), dimension(4) :: plane,q
-      real(WP), dimension(2) :: mk,Yb
+      real(WP), dimension(2) :: mk,Yb,mk0
+      real(WP), dimension(this%nQ+3) :: qc,qc0
+      real(WP), dimension(this%liq%ns) :: yLc
+      real(WP), dimension(this%gas%ns) :: yGc
       ! Reset failure and gate counters
       this%cnt%nrelax_fail=0.0_WP
       this%cnt%ngate=0.0_WP; this%cnt%ngate_floor=0.0_WP; this%cnt%gate_mass=0.0_WP; this%cnt%gate_energy=0.0_WP
@@ -2879,14 +3078,23 @@ end subroutine get_cell_velocity
                mk=max(pQ(i,j,k,1:2),0.0_WP)
                q(1:2)=pQ(i,j,k,1:2)
                q(3:4)=pQ(i,j,k,3:4)-mk/max(sum(mk),this%rho_floor)*cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
-               ! User-provided relaxation model to the capillary pressure jump (modifies VF and q), and the internal energy
-               ! it exchanges added to E_k
+               ! Cell vector in the layout of the relaxation models: [m_L,m_G,Y_L,Y_G], 3 unused slots, then the species Q(5:nQ)
+               qc=0.0_WP; qc(1:4)=q; qc(8:)=pQ(i,j,k,5:this%nQ); qc0=qc
+               ! User-provided relaxation model to the capillary pressure jump (modifies VF and qc, possibly the phasic masses
+               ! and species if it transfers mass), and the internal energy it exchanges added to E_k
                Yb=q(3:4); VFb=pVF(i,j,k,1)
-               call this%relax%apply(dt=dt,VF=pVF(i,j,k,1),Q=q,Pjump=this%sigma*pCurv(i,j,k,1),ierr=rerr)
+               call this%relax%apply(dt=dt,VF=pVF(i,j,k,1),Q=qc,Pjump=this%sigma*pCurv(i,j,k,1),ierr=rerr)
                ! Refuse a relaxation that leaves the gas below rhoG_min (torrens)
-               refused=rerr.eq.RELAX_OK.and.q(2).lt.this%rhoG_min*(1.0_WP-pVF(i,j,k,1))
-               if (refused) then; pVF(i,j,k,1)=VFb; q(3:4)=Yb; end if
-               pQ(i,j,k,3:4)=pQ(i,j,k,3:4)+q(3:4)-Yb
+               refused=rerr.eq.RELAX_OK.and.qc(2).lt.this%rhoG_min*(1.0_WP-pVF(i,j,k,1))
+               if (refused) then; pVF(i,j,k,1)=VFb; qc=qc0; end if
+               pQ(i,j,k,3:4)=pQ(i,j,k,3:4)+qc(3:4)-Yb
+               ! Mass transfer: new masses and species, and the kinetic energy shared by the new mass fractions
+               if (any(qc(1:2).ne.qc0(1:2))) then
+                  mk0=max(qc0(1:2),0.0_WP); mk=max(qc(1:2),0.0_WP)
+                  pQ(i,j,k,3:4)=pQ(i,j,k,3:4)+(mk/max(sum(mk),this%rho_floor)-mk0/max(sum(mk0),this%rho_floor))*cell_ke(pQ,pU,pV,pW,i,j,k,this%rho_floor)
+                  pQ(i,j,k,1:2)=qc(1:2)
+               end if
+               pQ(i,j,k,5:this%nQ)=qc(8:)
                if (rerr.ne.RELAX_OK.or.refused) this%cnt%nrelax_fail=this%cnt%nrelax_fail+1.0_WP
             end if
             ! Check if mixture cell after relaxation
@@ -2898,7 +3106,7 @@ end subroutine get_cell_velocity
                   pVF(i,j,k,1)=0.0_WP
                   pCL(i,j,k,1:3)=[this%amr%xlo+(real(i,WP)+0.5_WP)*dx,this%amr%ylo+(real(j,WP)+0.5_WP)*dy,this%amr%zlo+(real(k,WP)+0.5_WP)*dz]
                   pCG(i,j,k,1:3)=[this%amr%xlo+(real(i,WP)+0.5_WP)*dx,this%amr%ylo+(real(j,WP)+0.5_WP)*dy,this%amr%zlo+(real(k,WP)+0.5_WP)*dz]
-                  pQ(i,j,k,1)=0.0_WP
+                  pQ(i,j,k,1)=0.0_WP; pQ(i,j,k,this%Yl_lo:this%Yl_hi)=0.0_WP
                   pQ(i,j,k,4)=pQ(i,j,k,4)+pQ(i,j,k,3); pQ(i,j,k,3)=0.0_WP
                   pPLIC(i,j,k,:)=[0.0_WP,0.0_WP,0.0_WP,-1.0e10_WP]
                else if (pVF(i,j,k,1).gt.VFhi) then
@@ -2906,7 +3114,7 @@ end subroutine get_cell_velocity
                   pVF(i,j,k,1)=1.0_WP
                   pCL(i,j,k,1:3)=[this%amr%xlo+(real(i,WP)+0.5_WP)*dx,this%amr%ylo+(real(j,WP)+0.5_WP)*dy,this%amr%zlo+(real(k,WP)+0.5_WP)*dz]
                   pCG(i,j,k,1:3)=[this%amr%xlo+(real(i,WP)+0.5_WP)*dx,this%amr%ylo+(real(j,WP)+0.5_WP)*dy,this%amr%zlo+(real(k,WP)+0.5_WP)*dz]
-                  pQ(i,j,k,2)=0.0_WP
+                  pQ(i,j,k,2)=0.0_WP; pQ(i,j,k,this%Yg_lo:this%Yg_hi)=0.0_WP
                   pQ(i,j,k,3)=pQ(i,j,k,3)+pQ(i,j,k,4); pQ(i,j,k,4)=0.0_WP
                   pPLIC(i,j,k,:)=[0.0_WP,0.0_WP,0.0_WP,+1.0e10_WP]
                end if
@@ -2957,6 +3165,7 @@ end subroutine get_cell_velocity
          real(WP), dimension(2) :: alp,Tmin
          character(len=str_long) :: message
          qq=q
+         yLc=liq_y(this,pQ,i,j,k); yGc=gas_y(this,pQ,i,j,k)
          alp=[pVF(i,j,k,1),1.0_WP-pVF(i,j,k,1)]
          Tmin=[this%TminL,this%TminG]
          if (pVF(i,j,k,1).lt.VFlo.or.pVF(i,j,k,1).gt.VFhi) then
@@ -3000,6 +3209,11 @@ end subroutine get_cell_velocity
          this%cnt%ngate=this%cnt%ngate+1.0_WP
          this%cnt%gate_mass=this%cnt%gate_mass+pQ(i,j,k,n)*cell_vol
          pQ(i,j,k,n)=0.0_WP; pQ(i,j,k,2+n)=0.0_WP
+         if (n.eq.1) then
+            pQ(i,j,k,this%Yl_lo:this%Yl_hi)=0.0_WP
+         else
+            pQ(i,j,k,this%Yg_lo:this%Yg_hi)=0.0_WP
+         end if
          pVF(i,j,k,1)=merge(0.0_WP,1.0_WP,n.eq.1)
          ! Face momenta from the new face masses at the current face velocities
          do s=0,1
@@ -3015,29 +3229,19 @@ end subroutine get_cell_velocity
          this%cnt%gate_energy=this%cnt%gate_energy+(E0-pQ(i,j,k,2+o))*cell_vol
       end subroutine gate_cell
 
-      !> Material of phase n (1 liquid, 2 gas)
-      function phase(n) result(mat)
-         implicit none
-         integer, intent(in) :: n
-         class(material), pointer :: mat
-         if (n.eq.1) then
-            mat=>this%liq
-         else
-            mat=>this%gas
-         end if
-      end function phase
-
       !> Whether phase n of fraction a and content qq is inside its law's domain (positive internal content and sound speed)
       logical function inside(n,a,qq)
          implicit none
          integer, intent(in) :: n
          real(WP), intent(in) :: a
          real(WP), dimension(4), intent(in) :: qq
-         class(material), pointer :: mat
          inside=qq(n).gt.0.0_WP.and.qq(2+n).gt.0.0_WP
          if (.not.inside) return
-         mat=>phase(n)
-         inside=mat%get_c_from_rho_e(rho=qq(n)/a,e=qq(2+n)/qq(n),y=[1.0_WP]).gt.0.0_WP
+         if (n.eq.1) then
+            inside=this%liq%get_c_from_rho_e(rho=qq(n)/a,e=qq(2+n)/qq(n),y=yLc).gt.0.0_WP
+         else
+            inside=this%gas%get_c_from_rho_e(rho=qq(n)/a,e=qq(2+n)/qq(n),y=yGc).gt.0.0_WP
+         end if
       end function inside
 
       !> Temperature of pure phase n of content qq
@@ -3045,9 +3249,11 @@ end subroutine get_cell_velocity
          implicit none
          integer, intent(in) :: n
          real(WP), dimension(4), intent(in) :: qq
-         class(material), pointer :: mat
-         mat=>phase(n)
-         temperature=mat%get_T_from_rho_e(rho=qq(n),e=qq(2+n)/qq(n),y=[1.0_WP])
+         if (n.eq.1) then
+            temperature=this%liq%get_T_from_rho_e(rho=qq(n),e=qq(2+n)/qq(n),y=yLc)
+         else
+            temperature=this%gas%get_T_from_rho_e(rho=qq(n),e=qq(2+n)/qq(n),y=yGc)
+         end if
       end function temperature
 
       !> Raise the internal content of phase n (fraction a) of cell (i,j,k) to its value at the declared Tmin, booked
@@ -3057,10 +3263,12 @@ end subroutine get_cell_velocity
          real(WP), intent(in) :: a
          real(WP), dimension(4), intent(inout) :: qq
          real(WP) :: rho,Yf
-         class(material), pointer :: mat
-         mat=>phase(n)
          rho=qq(n)/a
-         Yf=qq(n)*mat%get_e_from_p_rho(p=mat%get_p_from_rho_T(rho=rho,T=merge(this%TminL,this%TminG,n.eq.1),y=[1.0_WP]),rho=rho,y=[1.0_WP])
+         if (n.eq.1) then
+            Yf=qq(n)*this%liq%get_e_from_p_rho(p=this%liq%get_p_from_rho_T(rho=rho,T=this%TminL,y=yLc),rho=rho,y=yLc)
+         else
+            Yf=qq(n)*this%gas%get_e_from_p_rho(p=this%gas%get_p_from_rho_T(rho=rho,T=this%TminG,y=yGc),rho=rho,y=yGc)
+         end if
          pQ(i,j,k,2+n)=pQ(i,j,k,2+n)+Yf-qq(2+n)
          this%cnt%ngate_floor=this%cnt%ngate_floor+1.0_WP
          this%cnt%gate_energy=this%cnt%gate_energy-(Yf-qq(2+n))*cell_vol
@@ -3170,8 +3378,9 @@ end subroutine get_cell_velocity
       type(amrex_box) :: bx
       integer :: lvl,i,j,k,ierr
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pQ,pP,pU,pV,pW,pVisc,pBeta,pC
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pRHOL,pRHOG,pIL,pIG,pDiffL,pDiffG
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pRHOL,pRHOG,pIL,pIG,pDiffL,pDiffG,pYl,pYg
       real(WP) :: dxi,dyi,dzi,rho,conv,pgrad,viscmax,alpha_heat
+      pYl=>null(); pYg=>null()
       ! Get convective CFL from parent
       call this%amrmpflow%get_cflc(dt=dt)
       ! Reset CFLs
@@ -3201,6 +3410,8 @@ end subroutine get_cell_velocity
             pRHOL=>this%RHOL%mf(lvl)%dataptr(mfi); pRHOG=>this%RHOG%mf(lvl)%dataptr(mfi)
             pIL=>this%IL%mf(lvl)%dataptr(mfi); pIG=>this%IG%mf(lvl)%dataptr(mfi)
             pDiffL=>this%diffL%mf(lvl)%dataptr(mfi); pDiffG=>this%diffG%mf(lvl)%dataptr(mfi)
+            if (this%liq%ns.gt.1) pYl=>this%Yl%mf(lvl)%dataptr(mfi)
+            if (this%gas%ns.gt.1) pYg=>this%Yg%mf(lvl)%dataptr(mfi)
             ! Loop over interior tiles
             bx=mfi%tilebox()
             do k=bx%lo(3),bx%hi(3); do j=bx%lo(2),bx%hi(2); do i=bx%lo(1),bx%hi(1)
@@ -3208,9 +3419,9 @@ end subroutine get_cell_velocity
                ! Heat-diffusion CFL
                alpha_heat=0.0_WP
                if (pVF(i,j,k,1).gt.VFhi.and.pRHOL(i,j,k,1).gt.0.0_WP) then
-                  alpha_heat=pDiffL(i,j,k,1)/max(pRHOL(i,j,k,1)*this%liq%get_cv_from_rho_e(rho=pRHOL(i,j,k,1),e=pIL(i,j,k,1),y=[1.0_WP]),tiny(1.0_WP))
+                  alpha_heat=pDiffL(i,j,k,1)/max(pRHOL(i,j,k,1)*this%liq%get_cv_from_rho_e(rho=pRHOL(i,j,k,1),e=pIL(i,j,k,1),y=cached_y(this%liq%ns,pYl,i,j,k)),tiny(1.0_WP))
                else if (pVF(i,j,k,1).lt.VFlo.and.pRHOG(i,j,k,1).gt.0.0_WP) then
-                  alpha_heat=pDiffG(i,j,k,1)/max(pRHOG(i,j,k,1)*this%gas%get_cv_from_rho_e(rho=pRHOG(i,j,k,1),e=pIG(i,j,k,1),y=[1.0_WP]),tiny(1.0_WP))
+                  alpha_heat=pDiffG(i,j,k,1)/max(pRHOG(i,j,k,1)*this%gas%get_cv_from_rho_e(rho=pRHOG(i,j,k,1),e=pIG(i,j,k,1),y=cached_y(this%gas%ns,pYg,i,j,k)),tiny(1.0_WP))
                end if
                ! Viscous CFL with the longitudinal coefficient (beta+4*visc/3)/rho, or the thermal diffusivity if larger
                viscmax=max((pBeta(i,j,k,1)+4.0_WP*pVisc(i,j,k,1)/3.0_WP)/rho,alpha_heat)
@@ -3264,9 +3475,10 @@ end subroutine get_cell_velocity
       type(amrex_imultifab) :: mask
       integer, dimension(:,:,:,:), contiguous, pointer :: pMask
       real(WP), dimension(:,:,:,:), contiguous, pointer :: pVF,pRHOL,pRHOG,pIL,pIG,pPL,pPG,pTL,pTG
-      real(WP), dimension(:,:,:,:), contiguous, pointer :: prhoU,prhoV,prhoW,pU,pV,pW,pQ
+      real(WP), dimension(:,:,:,:), contiguous, pointer :: prhoU,prhoV,prhoW,pU,pV,pW,pQ,pYl,pYg
       real(WP), dimension(10) :: buf
-      real(WP), dimension(4) :: Qsum
+      real(WP), dimension(this%nQ) :: Qsum
+      integer :: n
 
       ! Use parent's method first (velocity, Q, and VF statistics)
       call this%amrmpflow%get_info()
@@ -3292,6 +3504,9 @@ end subroutine get_cell_velocity
       this%dPmax=0.0_WP
       this%rhoKint=0.0_WP
       Qsum=0.0_WP
+      pYl=>null(); pYg=>null()
+      if (this%liq%ns.gt.1) then; this%Ylmin=huge(1.0_WP); this%Ylmax=-huge(1.0_WP); end if
+      if (this%gas%ns.gt.1) then; this%Ygmin=huge(1.0_WP); this%Ygmax=-huge(1.0_WP); end if
       do lvl=0,this%amr%clvl()
          ! Build fine mask for this level (if not finest)
          if (lvl.lt.this%amr%clvl()) then
@@ -3310,6 +3525,8 @@ end subroutine get_cell_velocity
             prhoV=>this%rhoV%mf(lvl)%dataptr(mfi); pV=>this%V%mf(lvl)%dataptr(mfi)
             prhoW=>this%rhoW%mf(lvl)%dataptr(mfi); pW=>this%W%mf(lvl)%dataptr(mfi)
             pQ=>this%Q%mf(lvl)%dataptr(mfi)
+            if (this%liq%ns.gt.1) pYl=>this%Yl%mf(lvl)%dataptr(mfi)
+            if (this%gas%ns.gt.1) pYg=>this%Yg%mf(lvl)%dataptr(mfi)
             if (lvl.lt.this%amr%clvl()) pMask=>mask%dataptr(mfi)
             ! Loop over interior tiles
             bx=mfi%tilebox()
@@ -3317,13 +3534,18 @@ end subroutine get_cell_velocity
                ! Skip cells covered by finer level
                if (lvl.lt.this%amr%clvl()) then; if (pMask(i,j,k,1).eq.0) cycle; end if
                ! Integrals of Q over uncovered cells (covered cells hold restricted internal contents, not averaged energies)
-               Qsum=Qsum+pQ(i,j,k,1:4)*this%amr%cell_vol(lvl)
+               Qsum=Qsum+pQ(i,j,k,:)*this%amr%cell_vol(lvl)
                ! Liquid variables
                if (pVF(i,j,k,1).ge.VFlo) then
                   this%RHOLmin=min(this%RHOLmin,pRHOL(i,j,k,1)); this%RHOLmax=max(this%RHOLmax,pRHOL(i,j,k,1))
                   this%ILmin  =min(this%ILmin  ,pIL  (i,j,k,1)); this%ILmax  =max(this%ILmax  ,pIL  (i,j,k,1))
                   this%PLmin  =min(this%PLmin  ,pPL  (i,j,k,1)); this%PLmax  =max(this%PLmax  ,pPL  (i,j,k,1))
                   this%TLmin  =min(this%TLmin  ,pTL  (i,j,k,1)); this%TLmax  =max(this%TLmax  ,pTL  (i,j,k,1))
+                  if (this%liq%ns.gt.1) then
+                     do n=1,this%liq%ns-1
+                        this%Ylmin(n)=min(this%Ylmin(n),pYl(i,j,k,n)); this%Ylmax(n)=max(this%Ylmax(n),pYl(i,j,k,n))
+                     end do
+                  end if
                end if
                ! Gas variables
                if (pVF(i,j,k,1).le.VFhi) then
@@ -3331,6 +3553,11 @@ end subroutine get_cell_velocity
                   this%IGmin  =min(this%IGmin  ,pIG  (i,j,k,1)); this%IGmax  =max(this%IGmax  ,pIG  (i,j,k,1))
                   this%PGmin  =min(this%PGmin  ,pPG  (i,j,k,1)); this%PGmax  =max(this%PGmax  ,pPG  (i,j,k,1))
                   this%TGmin  =min(this%TGmin  ,pTG  (i,j,k,1)); this%TGmax  =max(this%TGmax  ,pTG  (i,j,k,1))
+                  if (this%gas%ns.gt.1) then
+                     do n=1,this%gas%ns-1
+                        this%Ygmin(n)=min(this%Ygmin(n),pYg(i,j,k,n)); this%Ygmax(n)=max(this%Ygmax(n),pYg(i,j,k,n))
+                     end do
+                  end if
                end if
                ! Pressure gap in mixed cells
                if (pVF(i,j,k,1).ge.VFlo.and.pVF(i,j,k,1).le.VFhi) this%dPmax=max(this%dPmax,abs(pPL(i,j,k,1)-pPG(i,j,k,1)))
@@ -3352,7 +3579,15 @@ end subroutine get_cell_velocity
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%TGmin  ,1,MPI_REAL_WP,MPI_MIN,this%amr%comm,ierr); call MPI_ALLREDUCE(MPI_IN_PLACE,this%TGmax  ,1,MPI_REAL_WP,MPI_MAX,this%amr%comm,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%dPmax  ,1,MPI_REAL_WP,MPI_MAX,this%amr%comm,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,this%rhoKint,1,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr)
-      call MPI_ALLREDUCE(MPI_IN_PLACE,Qsum,4,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr); this%Qint=Qsum
+      call MPI_ALLREDUCE(MPI_IN_PLACE,Qsum,this%nQ,MPI_REAL_WP,MPI_SUM,this%amr%comm,ierr); this%Qint=Qsum
+      if (this%liq%ns.gt.1) then
+         call MPI_ALLREDUCE(MPI_IN_PLACE,this%Ylmin,this%liq%ns-1,MPI_REAL_WP,MPI_MIN,this%amr%comm,ierr)
+         call MPI_ALLREDUCE(MPI_IN_PLACE,this%Ylmax,this%liq%ns-1,MPI_REAL_WP,MPI_MAX,this%amr%comm,ierr)
+      end if
+      if (this%gas%ns.gt.1) then
+         call MPI_ALLREDUCE(MPI_IN_PLACE,this%Ygmin,this%gas%ns-1,MPI_REAL_WP,MPI_MIN,this%amr%comm,ierr)
+         call MPI_ALLREDUCE(MPI_IN_PLACE,this%Ygmax,this%gas%ns-1,MPI_REAL_WP,MPI_MAX,this%amr%comm,ierr)
+      end if
 
       ! Diagnostic counts of the last calls, summed across ranks from this rank's values
       buf=[this%cnt%nvf_guard,this%cnt%nsliver,this%cnt%nrelax_fail,this%cnt%ngate,this%cnt%gate_mass,this%cnt%gate_energy, &
