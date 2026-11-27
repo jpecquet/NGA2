@@ -14,7 +14,6 @@ module relax_igmix_sg_class
 
    public :: relax_igmix_sg
    public :: Prelax,PTrelax,PTgrelax,PThybrid
-   public :: Mv,Ma
    public :: apply   !< Exported so extensions can call it on their own polymorphic this (this%relax_igmix_sg%apply loses dispatch)
    ! debug: (dbg_i,dbg_j,dbg_k) identifies the cell CURRENTLY being traced; caller sets it to
    ! the active cell's own indices and dbg_cell=.true. right before apply(), so every print
@@ -31,8 +30,6 @@ module relax_igmix_sg_class
    integer, public :: dbg_klo=100000000, dbg_khi=-100000000
 
    !> Molar masses of vapor and air [kg/mol]
-   real(WP), parameter :: Mv=0.0180153_WP
-   real(WP), parameter :: Ma=0.02897_WP
 
    !> Model enum
    integer, parameter :: Prelax  =1   !< Mechanical only
@@ -54,6 +51,9 @@ module relax_igmix_sg_class
       !> Species indices for vapor and air in the gas mixture
       integer  :: indV =0
       integer  :: indA =0
+      !> Molar masses of vapor and carrier up to a common factor (only their ratio is used): 1/R from the gas constants,
+      !> set in initialize (were water/air constants); a multi-species wrapper may reset Ma per cell
+      real(WP) :: Mv=1.0_WP,Ma=1.0_WP
       !> Saturation curve coefficients (computed in initialize from material properties)
       real(WP) :: AS=0.0_WP,BS=0.0_WP,CS=0.0_WP,DS=0.0_WP,ES=0.0_WP
       !> Convergence tolerances
@@ -134,6 +134,7 @@ contains
       this%gas=>gas
       this%indV=indV
       this%indA=indA
+      this%Mv=1.0_WP/gas%R(indV); this%Ma=1.0_WP/gas%R(indA)
       ! Vapor properties from the gas mixture (flat-array access)
       cvV=gas%cv(indV)
       cpV=gas%cp(indV)
@@ -891,7 +892,7 @@ contains
          ! xv_eq=this%get_pvsat(p,T)/p
          ! The stiff liquid holds the gas volume, so the dry gas keeps its partial pressure and the vapor adds on top
          xv_eq=this%get_pvsat(p,T)/(p+this%get_pvsat(p,T))
-         Yv=xv_eq*Mv/(xv_eq*Mv+(1.0_WP-xv_eq)*Ma)
+         Yv=xv_eq*this%Mv/(xv_eq*this%Mv+(1.0_WP-xv_eq)*this%Ma)
          ! Keep the guess inside the reachable range (Yv_hi: all liquid evaporated)
          Yv=min(Yv,Yv0+0.5_WP*(min(Yvmax,1.0_WP-rhoA0/rho0)-Yv0))
       end if
@@ -1083,7 +1084,7 @@ contains
                if (dbg_cell) print*,'Too much vapor pressure, seeding Yv=',Y_seed
                Yv_=Y_seed
             else
-               xv=pv_/(p_-Pjump); Yv_=xv*Mv/(xv*Mv+(1.0_WP-xv)*Ma)
+               xv=pv_/(p_-Pjump); Yv_=xv*this%Mv/(xv*this%Mv+(1.0_WP-xv)*this%Ma)
                if (Yv_.lt.Y_small) then
                   if (dbg_cell) print*,'Too little Yv, seeding Yv=',Y_seed
                   Yv_=Y_seed
@@ -1145,8 +1146,8 @@ contains
          real(WP), intent(in) :: Yv_
          real(WP) :: Ys,den
          Ys=max(Yv_,Yvmin+fd_eps)
-         den=Ys*Ma+(1.0_WP-Ys)*Mv
-         dlnxvdYv=1.0_WP/Ys-(Ma-Mv)/den
+         den=Ys*this%Ma+(1.0_WP-Ys)*this%Mv
+         dlnxvdYv=1.0_WP/Ys-(this%Ma-this%Mv)/den
       end function dlnxvdYv
       !> LV solve: damped Newton in ln(p)
       subroutine solve_lv(p_eq,T_eq,conv)
@@ -1673,7 +1674,7 @@ contains
       implicit none
       class(relax_igmix_sg), intent(in) :: this
       real(WP), intent(in) :: Yv_
-      get_xv=Yv_*Ma/(Yv_*Ma+(1.0_WP-Yv_)*Mv)
+      get_xv=Yv_*this%Ma/(Yv_*this%Ma+(1.0_WP-Yv_)*this%Mv)
    end function get_xv
 
    !> Equilibrium T from energy conservation in liquid-vapor-gas mixture (SG form: no co-volume)

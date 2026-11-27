@@ -4,7 +4,7 @@
 !> References Pelanti 2022 https://doi.org/10.1016/j.ijmultiphaseflow.2022.104097
 module relax_igmix_nasg_finite_class
    use precision,               only: WP
-   use relax_igmix_sg_class,    only: relax_igmix_sg,sg_apply=>apply,Prelax,PTgrelax,Mv,Ma,dbg_cell,dbg_i,dbg_j
+   use relax_igmix_sg_class,    only: relax_igmix_sg,sg_apply=>apply,Prelax,PTgrelax,dbg_cell,dbg_i,dbg_j
    use stiffened_gas_class,     only: stiffened_gas
    use nasg_class,              only: nasg
    use igmix_class,             only: igmix
@@ -1067,7 +1067,7 @@ contains
          g2=this%gas%cp(this%indV)*TG+this%gas%q(this%indV)-TG*(this%gas%cp(this%indV)*log(TG)+this%gas%qp(this%indV))
          ! m_s: vapor mass at which F_C=0, from p_vs=exp((g_l-g_v0)/(Rv*T)) and the dilute x_v=(Ma/Mv)*m_v/m_a
          mAir=Q(2)-max(Q(iVQ),0.0_WP)
-         ms=(Mv/Ma)*mAir*exp((g1-g2)/(RV*TG)-log(PG))
+         ms=(this%Mv/this%Ma)*mAir*exp((g1-g2)/(RV*TG)-log(PG))
          u0=max(Q(iVQ),0.0_WP)/ms
          if (u0.ge.1.0_WP) then
             ok=.true.
@@ -1131,7 +1131,7 @@ contains
       ! Saturation vapor mass fraction at p_g: x_vs=p_vs/p_g (1 if the liquid boils at this p,T)
       xs=exp(lnpvs-log(PG))
       Ysat=1.0_WP
-      if (xs.lt.1.0_WP) Ysat=xs*Mv/(xs*Mv+(1.0_WP-xs)*Ma)
+      if (xs.lt.1.0_WP) Ysat=xs*this%Mv/(xs*this%Mv+(1.0_WP-xs)*this%Ma)
       if (dbg_cell) print*,'[get_chem_transfer] VFeq=VF+S_alpha*dm=',VFeq,' Ysat=',Ysat ! debug
       ok=.true.
    end subroutine get_chem_transfer
